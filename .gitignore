@@ -1,3 +1,7 @@
 /backend/.venv
 .DS_Store
 .vscode
+/sagemaker/model.pt
+/sagemaker/model.tar.gz
+__pycache__/
+*.pyc

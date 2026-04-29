@@ -24,6 +24,14 @@ pip install -q --upgrade pip
 pip install -q -r requirements.txt
 echo "    Backend dependencies ready."
 
+# Print inference mode
+if [ -n "$SAGEMAKER_ENDPOINT" ]; then
+  echo "    Inference mode: SageMaker endpoint '$SAGEMAKER_ENDPOINT' (region: ${AWS_DEFAULT_REGION:-us-east-1})"
+else
+  echo "    Inference mode: local PyTorch"
+  echo "    (Set SAGEMAKER_ENDPOINT=<name> before running to use SageMaker)"
+fi
+
 # Start backend in background
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload &
 BACKEND_PID=$!

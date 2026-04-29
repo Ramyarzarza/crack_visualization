@@ -1,6 +1,7 @@
 import io
 import os
 import base64
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +37,26 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
         status_code=500,
         content={"detail": f"{type(exc).__name__}: {exc}"},
     )
+
+# ---------------------------------------------------------------------------
+# SageMaker mode (optional)
+# Set SAGEMAKER_ENDPOINT env var to route inference to a SageMaker endpoint
+# instead of running PyTorch locally.
+# ---------------------------------------------------------------------------
+_SAGEMAKER_ENDPOINT = os.environ.get("SAGEMAKER_ENDPOINT", "").strip()
+_SAGEMAKER_REGION   = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+if _SAGEMAKER_ENDPOINT:
+    try:
+        import boto3 as _boto3
+        _sm_runtime = _boto3.client("sagemaker-runtime", region_name=_SAGEMAKER_REGION)
+        print(f"SageMaker mode enabled — endpoint: {_SAGEMAKER_ENDPOINT}")
+    except ImportError:
+        raise RuntimeError("boto3 is required for SageMaker mode: pip install boto3")
+else:
+    _sm_runtime = None
+    print("Local inference mode (no SAGEMAKER_ENDPOINT set)")
+
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -318,7 +339,8 @@ class PredictRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": str(DEVICE)}
+    mode = "sagemaker" if _SAGEMAKER_ENDPOINT else "local"
+    return {"status": "ok", "device": str(DEVICE), "inference_mode": mode}
 
 
 @app.get("/models")
@@ -340,53 +362,93 @@ def list_samples():
 def predict(req: PredictRequest):
     # Validate paths (no directory traversal)
     sample_name = Path(req.sample).name
-    model_name = Path(req.model).name
+    model_name  = Path(req.model).name
 
     sample_path = SAMPLES_DIR / sample_name
     if not sample_path.exists():
         raise HTTPException(status_code=404, detail=f"Sample not found: {sample_name}")
 
-    # Load model (cached after first load)
-    model = _load_model(model_name)
-
-    # Load image
+    # Load image (always done locally — it's just file I/O)
     img_gray = cv2.imread(str(sample_path), cv2.IMREAD_GRAYSCALE)
     if img_gray is None:
         raise HTTPException(status_code=500, detail="Could not read image file")
 
-    # Run inference
-    if req.split:
-        grid = req.split_grid
-        mask = _predict_split(model, img_gray, req.resolution, grid, req.confidence_threshold)
+    # ── Inference ────────────────────────────────────────────────────────────
+    if _SAGEMAKER_ENDPOINT:
+        # ── SageMaker path ──
+        _, img_encoded = cv2.imencode(".png", img_gray)
+        img_b64 = base64.b64encode(img_encoded.tobytes()).decode()
+        payload = json.dumps({
+            "image":                img_b64,
+            "resolution":           req.resolution,
+            "confidence_threshold": req.confidence_threshold,
+            "show_classes":         req.show_classes,
+        })
+        response  = _sm_runtime.invoke_endpoint(
+            EndpointName=_SAGEMAKER_ENDPOINT,
+            ContentType="application/json",
+            Body=payload,
+        )
+        sm_result = json.loads(response["Body"].read())
+
+        # Decode mask from SageMaker for overlay generation
+        mask_bytes = base64.b64decode(sm_result["mask"])
+        mask_pil   = PILImage.open(io.BytesIO(mask_bytes)).convert("RGB")
+        mask_rgb   = np.array(mask_pil)
+
+        # Rebuild grayscale mask for overlay
+        mask = np.zeros(mask_rgb.shape[:2], dtype=np.uint8)
+        mask[np.all(mask_rgb == [255, 0, 0],   axis=2)] = LINE_CLASS
+        mask[np.all(mask_rgb == [255, 215, 0], axis=2)] = SHAPE_CLASS
+
+        overlay_bgr = _create_overlay(img_gray, mask, alpha=0.4)
+
+        return {
+            "original": _ndarray_to_base64(cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR), is_bgr=True),
+            "mask":     _ndarray_to_base64(mask_rgb, is_bgr=False),
+            "overlay":  _ndarray_to_base64(overlay_bgr, is_bgr=True),
+            "stats": {
+                "line_percentage":   sm_result["line_percentage"],
+                "shape_percentage":  sm_result["shape_percentage"],
+                "defect_percentage": sm_result["defect_percentage"],
+                "has_crack":  sm_result["has_crack"],
+                "has_shape":  sm_result["has_shape"],
+                "image_size": {"width": int(img_gray.shape[1]), "height": int(img_gray.shape[0])},
+            },
+        }
+
     else:
-        mask = _predict_whole(model, img_gray, req.resolution, req.confidence_threshold)
+        # ── Local PyTorch path ──
+        model = _load_model(model_name)
 
-    # Apply class filter — zero out classes the user doesn't want to see
-    if "crack" not in req.show_classes:
-        mask[mask == LINE_CLASS] = 0
-    if "shape" not in req.show_classes:
-        mask[mask == SHAPE_CLASS] = 0
+        if req.split:
+            mask = _predict_split(model, img_gray, req.resolution, req.split_grid, req.confidence_threshold)
+        else:
+            mask = _predict_whole(model, img_gray, req.resolution, req.confidence_threshold)
 
-    # Build visualizations
-    overlay_bgr = _create_overlay(img_gray, mask, alpha=0.4)
-    mask_rgb = _mask_to_color_rgb(mask)
+        # Apply class filter
+        if "crack" not in req.show_classes:
+            mask[mask == LINE_CLASS]  = 0
+        if "shape" not in req.show_classes:
+            mask[mask == SHAPE_CLASS] = 0
 
-    # Statistics
-    total = mask.size
-    line_pct = float((mask == LINE_CLASS).sum() / total * 100)
-    shape_pct = float((mask == SHAPE_CLASS).sum() / total * 100)
-    defect_pct = line_pct + shape_pct
+        overlay_bgr = _create_overlay(img_gray, mask, alpha=0.4)
+        mask_rgb    = _mask_to_color_rgb(mask)
 
-    return {
-        "original": _ndarray_to_base64(cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR), is_bgr=True),
-        "mask": _ndarray_to_base64(mask_rgb, is_bgr=False),
-        "overlay": _ndarray_to_base64(overlay_bgr, is_bgr=True),
-        "stats": {
-            "line_percentage": round(line_pct, 3),
-            "shape_percentage": round(shape_pct, 3),
-            "defect_percentage": round(defect_pct, 3),
-            "has_crack": line_pct > 0.1,
-            "has_shape": shape_pct > 0.1,
-            "image_size": {"width": int(img_gray.shape[1]), "height": int(img_gray.shape[0])},
-        },
-    }
+        total     = mask.size
+        line_pct  = float((mask == LINE_CLASS).sum()  / total * 100)
+        shape_pct = float((mask == SHAPE_CLASS).sum() / total * 100)
+
+        return {
+            "original": _ndarray_to_base64(cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR), is_bgr=True),
+            "mask":     _ndarray_to_base64(mask_rgb, is_bgr=False),
+            "overlay":  _ndarray_to_base64(overlay_bgr, is_bgr=True),
+            "stats": {
+                "line_percentage":   round(line_pct,  3),
+                "shape_percentage":  round(shape_pct, 3),
+                "defect_percentage": round(line_pct + shape_pct, 3),
+                "has_crack":  line_pct  > 0.1,
+                "has_shape":  shape_pct > 0.1,
+                "image_size": {"width": int(img_gray.shape[1]), "height": int(img_gray.shape[0])},
+            },
+        }
