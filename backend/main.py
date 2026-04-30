@@ -42,11 +42,18 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 # SageMaker mode (optional)
 # Set SAGEMAKER_ENDPOINT env var to route inference to a SageMaker endpoint
 # instead of running PyTorch locally.
+# Set USE_LOCAL_INFERENCE = True to force local PyTorch regardless of SAGEMAKER_ENDPOINT.
 # ---------------------------------------------------------------------------
-_SAGEMAKER_ENDPOINT = os.environ.get("SAGEMAKER_ENDPOINT", "").strip()
-_SAGEMAKER_REGION   = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+USE_LOCAL_INFERENCE  = False  # ← change to True to force local PyTorch
 
-if _SAGEMAKER_ENDPOINT:
+_SAGEMAKER_ENDPOINT  = os.environ.get("SAGEMAKER_ENDPOINT", "").strip()
+_SAGEMAKER_REGION    = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+if USE_LOCAL_INFERENCE:
+    _SAGEMAKER_ENDPOINT = ""  # override: ignore any SAGEMAKER_ENDPOINT
+    _sm_runtime = None
+    print("Local inference mode (USE_LOCAL_INFERENCE=true)")
+elif _SAGEMAKER_ENDPOINT:
     try:
         import boto3 as _boto3
         _sm_runtime = _boto3.client("sagemaker-runtime", region_name=_SAGEMAKER_REGION)
@@ -380,6 +387,7 @@ def predict(req: PredictRequest):
         img_b64 = base64.b64encode(img_encoded.tobytes()).decode()
         payload = json.dumps({
             "image":                img_b64,
+            "model_name":           model_name,
             "resolution":           req.resolution,
             "confidence_threshold": req.confidence_threshold,
             "show_classes":         req.show_classes,

@@ -1,18 +1,14 @@
 """
-Run this script ONCE to deploy a crack-detection model to a SageMaker
-Serverless Inference endpoint.
+Run this script ONCE to deploy ALL crack-detection models to a single
+SageMaker Serverless Inference endpoint.
 
 Usage:
-    cd sagemaker/
-    python deploy.py \
+    python sagemaker/deploy.py \
         --role   arn:aws:iam::123456789012:role/SageMakerCrackDetectionRole \
         --bucket your-s3-bucket-name \
-        --model  "Generalized_dataset_bestmodel_real+simple background_more epochs.pt" \
         --region us-east-1
 """
 import argparse
-import shutil
-import subprocess
 import sys
 import tarfile
 import tempfile
@@ -32,11 +28,16 @@ ENDPOINT_NAME  = "crack-detection-endpoint"
 S3_KEY         = "crack-detection/model.tar.gz"
 
 
-def build_tarball(model_path: Path, inference_py: Path, out: Path) -> None:
-    """Package model.pt + inference.py into model.tar.gz at root level."""
+def build_tarball(models_dir: Path, inference_py: Path, out: Path) -> None:
+    """Package ALL .pt files from models_dir + inference.py into model.tar.gz."""
+    pt_files = sorted(models_dir.glob("*.pt"))
+    if not pt_files:
+        sys.exit(f"No .pt files found in {models_dir}")
     with tarfile.open(out, "w:gz") as tar:
-        tar.add(model_path,    arcname="model.pt")
-        tar.add(inference_py,  arcname="inference.py")
+        for pt in pt_files:
+            tar.add(pt, arcname=pt.name)
+            print(f"    + {pt.name}")
+        tar.add(inference_py, arcname="inference.py")
     print(f"  Packaged: {out} ({out.stat().st_size / 1e6:.1f} MB)")
 
 
@@ -60,13 +61,13 @@ def upload_to_s3(local: Path, bucket: str, key: str, region: str) -> str:
     return f"s3://{bucket}/{key}"
 
 
-def deploy(role: str, bucket: str, model_file: str, region: str) -> None:
-    base = Path(__file__).parent.parent
-    model_path    = base / "Models" / model_file
+def deploy(role: str, bucket: str, region: str) -> None:
+    base          = Path(__file__).parent.parent
+    models_dir    = base / "Models"
     inference_py  = Path(__file__).parent / "inference.py"
 
-    if not model_path.exists():
-        sys.exit(f"Model not found: {model_path}")
+    if not models_dir.exists():
+        sys.exit(f"Models directory not found: {models_dir}")
     if not inference_py.exists():
         sys.exit(f"inference.py not found: {inference_py}")
 
@@ -74,7 +75,7 @@ def deploy(role: str, bucket: str, model_file: str, region: str) -> None:
     print("\n[1/4] Building model.tar.gz ...")
     with tempfile.TemporaryDirectory() as tmp:
         tarball = Path(tmp) / "model.tar.gz"
-        build_tarball(model_path, inference_py, tarball)
+        build_tarball(models_dir, inference_py, tarball)
 
         # 2. Upload to S3
         print("\n[2/4] Uploading to S3 ...")
@@ -142,7 +143,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--role",   required=True, help="SageMaker IAM Role ARN")
     parser.add_argument("--bucket", required=True, help="S3 bucket name")
-    parser.add_argument("--model",  required=True, help="Model filename inside Models/")
     parser.add_argument("--region", default="us-east-1")
     args = parser.parse_args()
-    deploy(args.role, args.bucket, args.model, args.region)
+    deploy(args.role, args.bucket, args.region)

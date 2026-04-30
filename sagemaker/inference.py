@@ -3,6 +3,7 @@ SageMaker inference script for crack detection.
 SageMaker calls: model_fn, input_fn, predict_fn, output_fn
 """
 import io, json, os, sys, types as _types, base64
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -61,15 +62,22 @@ for _n in ("__main__",):
 
 
 def model_fn(model_dir: str):
+    """Load all .pt files from model_dir and return a dict {filename: model}."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(os.path.join(model_dir, "model.pt"), map_location=device, weights_only=False)
-    if isinstance(ckpt, nn.Module):
-        model = ckpt
-    elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        model = UNetCompact(); model.load_state_dict(ckpt["model_state_dict"])
-    else:
-        model = UNetCompact(); model.load_state_dict(ckpt)
-    return model.to(device).eval()
+    models = {}
+    for pt_path in Path(model_dir).glob("*.pt"):
+        ckpt = torch.load(str(pt_path), map_location=device, weights_only=False)
+        if isinstance(ckpt, nn.Module):
+            model = ckpt
+        elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            model = UNetCompact(); model.load_state_dict(ckpt["model_state_dict"])
+        else:
+            model = UNetCompact(); model.load_state_dict(ckpt)
+        models[pt_path.name] = model.to(device).eval()
+        print(f"  Loaded model: {pt_path.name}")
+    if not models:
+        raise RuntimeError(f"No .pt files found in {model_dir}")
+    return models
 
 
 def input_fn(request_body: bytes, content_type: str):
@@ -82,17 +90,26 @@ def input_fn(request_body: bytes, content_type: str):
         raise ValueError("Could not decode image")
     return {
         "image":                img,
+        "model_name":           p.get("model_name", ""),
         "resolution":           int(p.get("resolution", 800)),
         "confidence_threshold": float(p.get("confidence_threshold", 0.5)),
         "show_classes":         p.get("show_classes", ["crack", "shape"]),
     }
 
 
-def predict_fn(data: dict, model: nn.Module):
+def predict_fn(data: dict, models: dict):
     img, res  = data["image"], data["resolution"]
     thr, sc   = data["confidence_threshold"], data["show_classes"]
     oh, ow    = img.shape
-    device    = next(model.parameters()).device
+
+    # Select model by name; fall back to first available
+    model_name = data.get("model_name", "")
+    if model_name and model_name in models:
+        model = models[model_name]
+    else:
+        model = next(iter(models.values()))
+
+    device = next(model.parameters()).device
 
     t = torch.from_numpy(cv2.resize(img, (res, res))).float() / 255.0
     t = t.unsqueeze(0).unsqueeze(0).to(device)
