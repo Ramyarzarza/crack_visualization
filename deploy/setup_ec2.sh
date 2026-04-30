@@ -14,8 +14,8 @@ sudo apt-get update -q
 sudo apt-get install -y -q python3 python3-pip python3-venv nginx git libgl1 curl
 
 echo "==> [2/7] Installing Node.js 20..."
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - -q
-sudo apt-get install -y -q nodejs
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
 
 echo "==> [3/7] Cloning / updating repo..."
 if [ ! -d "$REPO_DIR" ]; then
