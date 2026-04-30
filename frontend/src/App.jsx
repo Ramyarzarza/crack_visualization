@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 
-const API = '/api'
+const API = import.meta.env.VITE_API_URL ?? '/api'
 
 const RESOLUTIONS = [256, 512, 800, 1600]
 const GRIDS = [2, 3, 4]
