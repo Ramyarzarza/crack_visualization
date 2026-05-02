@@ -61,7 +61,14 @@ sudo systemctl restart crack-backend
 ## SSH Into EC2
 
 ```bash
-ssh -i ~/Downloads/crack-detection-key.pem ubuntu@54.88.167.121
+ssh -i crack_key.pem ubuntu@54.88.167.121
+```
+
+After connecting, to pull the latest version and restart the backend:
+
+```bash
+cd /opt/crack-visualization && bash deploy/update.sh
+sudo systemctl restart crack-backend
 ```
 
 ---
@@ -111,6 +118,23 @@ This will:
 2. `pip install -r requirements.txt` (if deps changed)
 3. `npm ci && npm run build` (rebuilds React)
 4. `systemctl restart crack-backend`
+
+### After pulling a new version manually
+
+If you pull changes manually (e.g. `git pull` without using `update.sh`), rebuild the frontend and restart services:
+
+```bash
+# Rebuild frontend
+cd /opt/crack-visualization/frontend
+npm install
+npm run build
+
+# Restart backend
+sudo systemctl restart crack-backend
+
+# Restart Nginx
+sudo systemctl restart nginx
+```
 
 ---
 
