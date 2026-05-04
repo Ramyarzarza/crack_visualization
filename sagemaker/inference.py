@@ -1,15 +1,20 @@
 """
 SageMaker inference script for crack detection.
 SageMaker calls: model_fn, input_fn, predict_fn, output_fn
+
+NOTE: This file must be self-contained — SageMaker cannot import from the
+workspace. Both UNetCompact and UNet (from U_net.py) are inlined here.
 """
 import io, json, os, sys, types as _types, base64
 from pathlib import Path
+from collections import OrderedDict
 
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import init
 from PIL import Image
 
 NUM_CLASSES  = 3
@@ -19,6 +24,9 @@ LINE_CLASS   = 255
 SHAPE_CLASS  = 125
 
 
+# ---------------------------------------------------------------------------
+# Architecture 1: UNetCompact  (Generalized_dataset_* models)
+# ---------------------------------------------------------------------------
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -53,12 +61,126 @@ class UNetCompact(nn.Module):
         return self.outc(d1)
 
 
+# ---------------------------------------------------------------------------
+# Architecture 2: UNet  (U-net_model_* models — inlined from U_net.py)
+# ---------------------------------------------------------------------------
+def _conv3x3(in_ch, out_ch, stride=1, padding=1, bias=True, groups=1):
+    return nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride,
+                     padding=padding, bias=bias, groups=groups)
+
+def _upconv2x2(in_ch, out_ch, mode='transpose'):
+    if mode == 'transpose':
+        return nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+    return nn.Sequential(nn.Upsample(mode='bilinear', scale_factor=2),
+                         nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1))
+
+def _conv1x1(in_ch, out_ch, groups=1):
+    return nn.Conv2d(in_ch, out_ch, kernel_size=1, groups=groups, stride=1)
+
+
+class DownConv(nn.Module):
+    def __init__(self, in_channels, out_channels, pooling=True):
+        super().__init__()
+        self.pooling = pooling
+        self.conv1 = _conv3x3(in_channels, out_channels)
+        self.conv2 = _conv3x3(out_channels, out_channels)
+        if pooling:
+            self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        before_pool = x
+        if self.pooling:
+            x = self.pool(x)
+        return x, before_pool
+
+
+class UpConv(nn.Module):
+    def __init__(self, in_channels, out_channels, merge_mode='concat', up_mode='transpose'):
+        super().__init__()
+        self.merge_mode = merge_mode
+        self.upconv = _upconv2x2(in_channels, out_channels, mode=up_mode)
+        if merge_mode == 'concat':
+            self.conv1 = _conv3x3(2 * out_channels, out_channels)
+        else:
+            self.conv1 = _conv3x3(out_channels, out_channels)
+        self.conv2 = _conv3x3(out_channels, out_channels)
+
+    def forward(self, from_down, from_up):
+        from_up = self.upconv(from_up)
+        x = torch.cat((from_up, from_down), 1) if self.merge_mode == 'concat' else from_up + from_down
+        return F.relu(self.conv2(F.relu(self.conv1(x))))
+
+
+class UNet(nn.Module):
+    def __init__(self, num_classes, in_channels=3, depth=5,
+                 start_filts=64, up_mode='transpose', merge_mode='concat'):
+        super().__init__()
+        self.num_classes = num_classes
+        self.in_channels = in_channels
+        self.start_filts = start_filts
+        self.depth = depth
+
+        down_convs, up_convs = [], []
+        outs = None
+        for i in range(depth):
+            ins  = in_channels if i == 0 else outs
+            outs = start_filts * (2 ** i)
+            down_convs.append(DownConv(ins, outs, pooling=(i < depth - 1)))
+
+        for i in range(depth - 1):
+            ins  = outs
+            outs = ins // 2
+            up_convs.append(UpConv(ins, outs, up_mode=up_mode, merge_mode=merge_mode))
+
+        self.down_convs  = nn.ModuleList(down_convs)
+        self.up_convs    = nn.ModuleList(up_convs)
+        self.conv_final  = _conv1x1(outs, num_classes)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        encoder_outs = []
+        for module in self.down_convs:
+            x, before_pool = module(x)
+            encoder_outs.append(before_pool)
+        for i, module in enumerate(self.up_convs):
+            x = module(encoder_outs[-(i + 2)], x)
+        return self.conv_final(x)
+
+
+# ---------------------------------------------------------------------------
+# Architecture auto-detection
+# ---------------------------------------------------------------------------
+def _build_model_from_state_dict(state_dict: dict) -> nn.Module:
+    if any(k.startswith("down_convs.") for k in state_dict):
+        num_classes = state_dict["conv_final.weight"].shape[0]
+        in_channels = state_dict["down_convs.0.conv1.weight"].shape[1]
+        depth       = sum(1 for k in state_dict if k.startswith("down_convs.") and k.endswith(".conv1.weight"))
+        start_filts = state_dict["down_convs.0.conv1.weight"].shape[0]
+        return UNet(num_classes=num_classes, in_channels=in_channels,
+                    depth=depth, start_filts=start_filts)
+    return UNetCompact(num_classes=NUM_CLASSES)
+
+
+# ---------------------------------------------------------------------------
 # Pickle compatibility: checkpoint was saved in Jupyter __main__
-for _n in ("__main__",):
+# ---------------------------------------------------------------------------
+for _n in ("__main__", "__mp_main__"):
     _m = sys.modules.get(_n) or _types.ModuleType(_n)
     sys.modules[_n] = _m
     _m.UNetCompact = UNetCompact
     _m.ConvBlock   = ConvBlock
+    _m.UNet        = UNet
+    _m.DownConv    = DownConv
+    _m.UpConv      = UpConv
 
 
 def model_fn(model_dir: str):
@@ -66,13 +188,18 @@ def model_fn(model_dir: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     models = {}
     for pt_path in Path(model_dir).glob("*.pt"):
-        ckpt = torch.load(str(pt_path), map_location=device, weights_only=False)
+        # Always load to CPU first to avoid DataParallel cuda:0 conflicts
+        ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
         if isinstance(ckpt, nn.Module):
-            model = ckpt
-        elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-            model = UNetCompact(); model.load_state_dict(ckpt["model_state_dict"])
+            model = ckpt.module if isinstance(ckpt, nn.DataParallel) else ckpt
+        elif isinstance(ckpt, dict):
+            state_dict = ckpt.get("model_state_dict", ckpt)
+            if any(k.startswith("module.") for k in state_dict):
+                state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+            model = _build_model_from_state_dict(state_dict)
+            model.load_state_dict(state_dict)
         else:
-            model = UNetCompact(); model.load_state_dict(ckpt)
+            raise RuntimeError(f"Unsupported checkpoint type for {pt_path.name}: {type(ckpt)}")
         models[pt_path.name] = model.to(device).eval()
         print(f"  Loaded model: {pt_path.name}")
     if not models:
@@ -112,7 +239,11 @@ def predict_fn(data: dict, models: dict):
     device = next(model.parameters()).device
 
     t = torch.from_numpy(cv2.resize(img, (res, res))).float() / 255.0
-    t = t.unsqueeze(0).unsqueeze(0).to(device)
+    t = t.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+    in_channels = getattr(model, 'in_channels', 1)
+    if in_channels > 1:
+        t = t.expand(-1, in_channels, -1, -1)  # [1, C, H, W]
+    t = t.to(device)
 
     with torch.no_grad():
         logits = model(t)

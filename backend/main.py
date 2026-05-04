@@ -72,6 +72,12 @@ else:
 # Paths & constants
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent.parent
+
+# Make the workspace root importable so U_net.py can be imported
+import sys as _sys_path_setup
+if str(BASE_DIR) not in _sys_path_setup.path:
+    _sys_path_setup.path.insert(0, str(BASE_DIR))
+from U_net import UNet, DownConv, UpConv
 MODELS_DIR = BASE_DIR / "Models"
 SAMPLES_DIR = BASE_DIR / "samples"
 
@@ -160,12 +166,29 @@ for _mod_name in ("__main__", "__mp_main__"):
         _sys.modules[_mod_name] = _mod
     _mod.UNetCompact = UNetCompact
     _mod.ConvBlock = ConvBlock
+    _mod.UNet = UNet
+    _mod.DownConv = DownConv
+    _mod.UpConv = UpConv
 
 
 # ---------------------------------------------------------------------------
 # Model cache
 # ---------------------------------------------------------------------------
 _model_cache: dict[str, nn.Module] = {}
+
+
+def _build_model_from_state_dict(state_dict: dict) -> nn.Module:
+    """Instantiate the correct architecture by inspecting state dict keys."""
+    if any(k.startswith("down_convs.") for k in state_dict):
+        # UNet architecture (U_net.py)
+        num_classes  = state_dict["conv_final.weight"].shape[0]
+        in_channels  = state_dict["down_convs.0.conv1.weight"].shape[1]
+        depth        = sum(1 for k in state_dict if k.startswith("down_convs.") and k.endswith(".conv1.weight"))
+        start_filts  = state_dict["down_convs.0.conv1.weight"].shape[0]
+        return UNet(num_classes=num_classes, in_channels=in_channels, depth=depth, start_filts=start_filts)
+    else:
+        # UNetCompact architecture
+        return UNetCompact(num_classes=NUM_CLASSES)
 
 
 def _load_model(model_name: str) -> nn.Module:
@@ -176,16 +199,19 @@ def _load_model(model_name: str) -> nn.Module:
     if not model_path.exists():
         raise HTTPException(status_code=404, detail=f"Model file not found: {model_name}")
 
-    checkpoint = torch.load(str(model_path), map_location=DEVICE, weights_only=False)
+    checkpoint = torch.load(str(model_path), map_location="cpu", weights_only=False)
 
     if isinstance(checkpoint, nn.Module):
-        model = checkpoint
-    elif isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model = UNetCompact(num_classes=NUM_CLASSES)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        # Unwrap DataParallel — it hard-codes device_ids=[0] (cuda) which
+        # causes a crash when running on CPU or a different device.
+        model = checkpoint.module if isinstance(checkpoint, nn.DataParallel) else checkpoint
     elif isinstance(checkpoint, dict):
-        model = UNetCompact(num_classes=NUM_CLASSES)
-        model.load_state_dict(checkpoint)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        # Strip "module." prefix produced by DataParallel saves
+        if any(k.startswith("module.") for k in state_dict):
+            state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+        model = _build_model_from_state_dict(state_dict)
+        model.load_state_dict(state_dict)
     else:
         raise HTTPException(status_code=500, detail=f"Unsupported checkpoint type: {type(checkpoint)}")
 
@@ -228,7 +254,12 @@ def _predict_tile(
     original_h, original_w = tile_gray.shape
     resized = cv2.resize(tile_gray, (resolution, resolution))
     tensor = torch.from_numpy(resized).float() / 255.0
-    tensor = tensor.unsqueeze(0).unsqueeze(0).to(DEVICE)
+    # Expand to the number of channels the model expects (usually 1, sometimes 3)
+    in_channels = getattr(model, 'in_channels', 1)
+    tensor = tensor.unsqueeze(0).unsqueeze(0)           # [1, 1, H, W]
+    if in_channels > 1:
+        tensor = tensor.expand(-1, in_channels, -1, -1) # [1, C, H, W]
+    tensor = tensor.to(DEVICE)
 
     with torch.no_grad():
         prediction = model(tensor)
