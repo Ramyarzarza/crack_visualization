@@ -97,7 +97,13 @@ export default function App() {
             intensity_max: intensityMax,
           }),
         })
-        if (!res.ok) return
+        if (!res.ok) {
+          if (res.status === 400) {
+            // Server cache was cleared (e.g. restart) — stop calling /filter until next predict
+            hasResultRef.current = false
+          }
+          return
+        }
         const data = await res.json()
         setResult((prev) => prev ? { ...prev, mask: data.mask, overlay: data.overlay, stats: data.stats, circle: data.circle } : prev)
       } catch {}

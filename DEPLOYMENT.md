@@ -115,9 +115,67 @@ cd /opt/crack-visualization && bash deploy/update.sh
 
 This will:
 1. `git pull` latest code
-2. `pip install -r requirements.txt` (if deps changed)
-3. `npm ci && npm run build` (rebuilds React)
-4. `systemctl restart crack-backend`
+2. `git lfs pull` — downloads actual model `.pt` binaries (Git LFS pointers are replaced with real files)
+3. `pip install -r requirements.txt` (if deps changed)
+4. `npm ci && npm run build` (rebuilds React)
+5. `systemctl restart crack-backend`
+
+---
+
+## Adding a New Model
+
+Follow these steps whenever you add a new `.pt` model file.
+
+### 1. Add the model file locally
+
+```bash
+cd "/Users/ramyar/Git/Crack Visualization"
+
+# Copy your new .pt file into the Models/ directory
+cp /path/to/your/NewModel.pt Models/
+```
+
+All `*.pt` files are automatically tracked by Git LFS (configured in `.gitattributes`). No extra `git lfs track` command needed.
+
+### 2. Commit and push
+
+```bash
+git add Models/NewModel.pt
+git commit -m "Add NewModel"
+git push
+```
+
+Git LFS uploads the binary to LFS storage; only a small pointer file goes into the Git history.
+
+### 3. Deploy to EC2
+
+SSH into the server and run `update.sh`:
+
+```bash
+ssh -i crack_key.pem ubuntu@54.88.167.121
+cd /opt/crack-visualization && bash deploy/update.sh
+```
+
+`update.sh` runs `git lfs pull` automatically, so the real binary is downloaded (not just the LFS pointer).
+
+### 4. Re-deploy SageMaker endpoint
+
+The SageMaker endpoint packages **all** models from `Models/` into one `model.tar.gz`. Run this locally to rebuild and redeploy it:
+
+```bash
+cd "/Users/ramyar/Git/Crack Visualization"
+source backend/.venv/bin/activate
+python sagemaker/deploy.py \
+  --role "arn:aws:iam::588978531879:role/SageMakerCrackDetectionRole" \
+  --bucket "crack-detection-ramyar" \
+  --region "us-east-1"
+```
+
+This deletes and recreates the endpoint. Wait ~5 minutes, then verify:
+- AWS Console → SageMaker → Inference → Endpoints → `crack-detection-endpoint` → Status: **InService**
+- Or from EC2: `curl http://localhost/api/models` — new model should appear in the list
+
+---
 
 ### After pulling a new version manually
 
