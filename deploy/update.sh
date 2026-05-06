@@ -9,6 +9,7 @@ SERVICE_NAME="crack-backend"
 echo "==> Pulling latest code..."
 cd "$REPO_DIR"
 git pull
+git lfs pull
 
 echo "==> Updating Python dependencies..."
 source backend/.venv/bin/activate
