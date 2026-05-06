@@ -782,12 +782,13 @@ def predict(req: PredictRequest):
             )
         except Exception as _e:
             _ename = type(_e).__name__
+            print(f"SageMaker invoke_endpoint error [{_ename}]: {_e}")
             if "ReadTimeout" in _ename or "Timeout" in _ename:
                 raise HTTPException(
                     status_code=504,
                     detail="SageMaker inference timed out. This model is too heavy for the serverless endpoint. Try a smaller model or lower resolution.",
                 )
-            raise HTTPException(status_code=502, detail=f"SageMaker error: {_e}")
+            raise HTTPException(status_code=502, detail=f"SageMaker error ({_ename}): {_e}")
         sm_result = json.loads(response["Body"].read())
 
         # Decode mask from SageMaker for overlay generation
