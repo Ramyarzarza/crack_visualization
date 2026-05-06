@@ -47,7 +47,7 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 # instead of running PyTorch locally.
 # Set USE_LOCAL_INFERENCE = True to force local PyTorch regardless of SAGEMAKER_ENDPOINT.
 # ---------------------------------------------------------------------------
-USE_LOCAL_INFERENCE  = True  # ← change to True to force local PyTorch
+USE_LOCAL_INFERENCE  = False  # ← change to True to force local PyTorch
 
 _SAGEMAKER_ENDPOINT  = os.environ.get("SAGEMAKER_ENDPOINT", "").strip()
 _SAGEMAKER_REGION    = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
