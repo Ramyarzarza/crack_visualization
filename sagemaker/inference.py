@@ -183,28 +183,31 @@ for _n in ("__main__", "__mp_main__"):
     _m.UpConv      = UpConv
 
 
+def _load_single_model(pt_path: Path) -> nn.Module:
+    """Load one .pt file and return an eval-mode model on CPU."""
+    ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+    if isinstance(ckpt, nn.Module):
+        model = ckpt.module if isinstance(ckpt, nn.DataParallel) else ckpt
+    elif isinstance(ckpt, dict):
+        state_dict = ckpt.get("model_state_dict", ckpt)
+        if any(k.startswith("module.") for k in state_dict):
+            state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+        model = _build_model_from_state_dict(state_dict)
+        model.load_state_dict(state_dict)
+    else:
+        raise RuntimeError(f"Unsupported checkpoint type for {pt_path.name}: {type(ckpt)}")
+    return model.eval()
+
+
 def model_fn(model_dir: str):
-    """Load all .pt files from model_dir and return a dict {filename: model}."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    models = {}
-    for pt_path in Path(model_dir).glob("*.pt"):
-        # Always load to CPU first to avoid DataParallel cuda:0 conflicts
-        ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
-        if isinstance(ckpt, nn.Module):
-            model = ckpt.module if isinstance(ckpt, nn.DataParallel) else ckpt
-        elif isinstance(ckpt, dict):
-            state_dict = ckpt.get("model_state_dict", ckpt)
-            if any(k.startswith("module.") for k in state_dict):
-                state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
-            model = _build_model_from_state_dict(state_dict)
-            model.load_state_dict(state_dict)
-        else:
-            raise RuntimeError(f"Unsupported checkpoint type for {pt_path.name}: {type(ckpt)}")
-        models[pt_path.name] = model.to(device).eval()
-        print(f"  Loaded model: {pt_path.name}")
-    if not models:
+    """Return a lazy loader dict: {filename: Path}.  Models are loaded on first use."""
+    pt_files = list(Path(model_dir).glob("*.pt"))
+    if not pt_files:
         raise RuntimeError(f"No .pt files found in {model_dir}")
-    return models
+    model_paths = {p.name: p for p in pt_files}
+    print(f"  Found {len(model_paths)} model(s) — will load on first use: {list(model_paths.keys())}")
+    # Return a lazy-loading wrapper instead of pre-loaded models
+    return {"_paths": model_paths, "_cache": {}}
 
 
 def input_fn(request_body: bytes, content_type: str):
@@ -224,19 +227,31 @@ def input_fn(request_body: bytes, content_type: str):
     }
 
 
-def predict_fn(data: dict, models: dict):
+def predict_fn(data: dict, model_store: dict):
     img, res  = data["image"], data["resolution"]
     thr, sc   = data["confidence_threshold"], data["show_classes"]
     oh, ow    = img.shape
 
-    # Select model by name; fall back to first available
+    # Resolve the requested model from the lazy store
     model_name = data.get("model_name", "")
-    if model_name and model_name in models:
-        model = models[model_name]
-    else:
-        model = next(iter(models.values()))
+    paths: dict = model_store["_paths"]
+    cache: dict = model_store["_cache"]
 
-    device = next(model.parameters()).device
+    # Pick the target filename
+    if model_name and model_name in paths:
+        target = model_name
+    else:
+        target = next(iter(paths))
+
+    # Load & cache on first use
+    if target not in cache:
+        print(f"  Lazy-loading model: {target}")
+        cache[target] = _load_single_model(paths[target])
+        print(f"  Model loaded: {target}")
+
+    model  = cache[target]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = model.to(device)
 
     t = torch.from_numpy(cv2.resize(img, (res, res))).float() / 255.0
     t = t.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
