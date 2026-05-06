@@ -59,7 +59,12 @@ if USE_LOCAL_INFERENCE:
 elif _SAGEMAKER_ENDPOINT:
     try:
         import boto3 as _boto3
-        _sm_runtime = _boto3.client("sagemaker-runtime", region_name=_SAGEMAKER_REGION)
+        from botocore.config import Config as _BotocoreConfig
+        _sm_runtime = _boto3.client(
+            "sagemaker-runtime",
+            region_name=_SAGEMAKER_REGION,
+            config=_BotocoreConfig(read_timeout=120, retries={"max_attempts": 0}),
+        )
         print(f"SageMaker mode enabled — endpoint: {_SAGEMAKER_ENDPOINT}")
     except ImportError:
         raise RuntimeError("boto3 is required for SageMaker mode: pip install boto3")
@@ -769,11 +774,20 @@ def predict(req: PredictRequest):
             "confidence_threshold": req.confidence_threshold,
             "show_classes":         req.show_classes,
         })
-        response  = _sm_runtime.invoke_endpoint(
-            EndpointName=_SAGEMAKER_ENDPOINT,
-            ContentType="application/json",
-            Body=payload,
-        )
+        try:
+            response  = _sm_runtime.invoke_endpoint(
+                EndpointName=_SAGEMAKER_ENDPOINT,
+                ContentType="application/json",
+                Body=payload,
+            )
+        except Exception as _e:
+            _ename = type(_e).__name__
+            if "ReadTimeout" in _ename or "Timeout" in _ename:
+                raise HTTPException(
+                    status_code=504,
+                    detail="SageMaker inference timed out. This model is too heavy for the serverless endpoint. Try a smaller model or lower resolution.",
+                )
+            raise HTTPException(status_code=502, detail=f"SageMaker error: {_e}")
         sm_result = json.loads(response["Body"].read())
 
         # Decode mask from SageMaker for overlay generation
