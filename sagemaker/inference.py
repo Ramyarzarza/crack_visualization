@@ -171,9 +171,9 @@ def _build_model_from_state_dict(state_dict: dict) -> nn.Module:
 
 
 # ---------------------------------------------------------------------------
-# Pickle compatibility: checkpoint was saved in Jupyter __main__
+# Pickle compatibility: checkpoint was saved in Jupyter __main__ or as U_net module
 # ---------------------------------------------------------------------------
-for _n in ("__main__", "__mp_main__"):
+for _n in ("__main__", "__mp_main__", "U_net"):
     _m = sys.modules.get(_n) or _types.ModuleType(_n)
     sys.modules[_n] = _m
     _m.UNetCompact = UNetCompact
