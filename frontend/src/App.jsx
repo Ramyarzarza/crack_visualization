@@ -5,6 +5,28 @@ const API = import.meta.env.VITE_API_URL ?? '/api'
 const RESOLUTIONS = [256, 512, 800, 1600]
 const GRIDS = [2, 3, 4]
 
+/**
+ * Draws a dimmed region outside the detected circle onto an existing canvas context.
+ * Also draws a thin circle boundary ring.
+ */
+function drawCircleOverlay(ctx, w, h, circle, opacity) {
+  const { cx, cy, radius } = circle
+  ctx.save()
+  // Darken area outside the circle using evenodd fill rule
+  ctx.beginPath()
+  ctx.rect(0, 0, w, h)
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2, true) // true = counterclockwise (cuts a hole)
+  ctx.fillStyle = `rgba(0, 0, 0, ${opacity})`
+  ctx.fill('evenodd')
+  // Draw the circle boundary as a thin ring
+  ctx.beginPath()
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2)
+  ctx.strokeStyle = 'rgba(120, 210, 255, 0.85)'
+  ctx.lineWidth = Math.max(1, Math.round(Math.min(w, h) / 400))
+  ctx.stroke()
+  ctx.restore()
+}
+
 export default function App() {
   const [models, setModels] = useState([])
   const [samples, setSamples] = useState([])
@@ -21,6 +43,16 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('overlay')
   const [intensityMin, setIntensityMin] = useState(0)
   const [intensityMax, setIntensityMax] = useState(255)
+  // Post-processing / crack filter
+  const [closeGapSize, setCloseGapSize] = useState(0)
+  const [minCrackArea, setMinCrackArea] = useState(0)
+  const [maxCircularity, setMaxCircularity] = useState(1.0)
+  const [circleMask, setCircleMask] = useState(false)
+  const [circleMaskMargin, setCircleMaskMargin] = useState(0)
+  const [circleMaskOffsetX, setCircleMaskOffsetX] = useState(0)
+  const [circleMaskOffsetY, setCircleMaskOffsetY] = useState(0)
+  const [circleOverlayOpacity, setCircleOverlayOpacity] = useState(0.35)
+  const hasResultRef = useRef(false)  // guards filter effect from running before first predict
   const canvasRef = useRef(null)
   const [viewerHeight, setViewerHeight] = useState(480)
   const dragState = useRef(null)
@@ -44,6 +76,35 @@ export default function App() {
       .catch(() => {})
   }, [])
 
+  // Debounced filter: re-apply post-processing on the cached mask whenever
+  // filter params change, without re-running model inference.
+  useEffect(() => {
+    if (!hasResultRef.current) return  // no prediction run yet
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API}/filter`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            close_gap_size: closeGapSize,
+            min_crack_area: minCrackArea,
+            max_circularity: maxCircularity,
+            circle_mask: circleMask,
+            circle_mask_margin: circleMaskMargin,
+            circle_mask_offset_x: circleMaskOffsetX,
+            circle_mask_offset_y: circleMaskOffsetY,
+            intensity_min: intensityMin,
+            intensity_max: intensityMax,
+          }),
+        })
+        if (!res.ok) return
+        const data = await res.json()
+        setResult((prev) => prev ? { ...prev, mask: data.mask, overlay: data.overlay, stats: data.stats, circle: data.circle } : prev)
+      } catch {}
+    }, 350)
+    return () => clearTimeout(timer)
+  }, [closeGapSize, minCrackArea, maxCircularity, circleMask, circleMaskMargin, circleMaskOffsetX, circleMaskOffsetY, intensityMin, intensityMax])  // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     if (!result || !canvasRef.current) return
     const canvas = canvasRef.current
@@ -57,6 +118,9 @@ export default function App() {
         canvas.width = img.naturalWidth
         canvas.height = img.naturalHeight
         ctx.drawImage(img, 0, 0)
+        if (circleMask && result.circle && circleOverlayOpacity > 0) {
+          drawCircleOverlay(ctx, canvas.width, canvas.height, result.circle, circleOverlayOpacity)
+        }
       }
       img.src = `data:image/png;base64,${result.original}`
       return () => { cancelled = true }
@@ -96,9 +160,8 @@ export default function App() {
         const isCrack = dCrack < dShape && dCrack < dBg && dCrack < 40000
         const isShape = dShape < dCrack && dShape < dBg && dShape < 40000
         const showLabel = (isCrack && showClasses.crack) || (isShape && showClasses.shape)
-        const inRange = gray >= intensityMin && gray <= intensityMax
 
-        if (showLabel && inRange) {
+        if (showLabel) {
           if (activeTab === 'overlay') {
             out.data[p]     = Math.round(gray * 0.6 + mr * 0.4)
             out.data[p + 1] = Math.round(gray * 0.6 + mg * 0.4)
@@ -112,6 +175,9 @@ export default function App() {
         out.data[p + 3] = 255
       }
       ctx.putImageData(out, 0, 0)
+      if (circleMask && result.circle && circleOverlayOpacity > 0) {
+        drawCircleOverlay(ctx, w, h, result.circle, circleOverlayOpacity)
+      }
     }
 
     origImg.onload = () => { origLoaded = true; render() }
@@ -120,7 +186,7 @@ export default function App() {
     maskImg.src = `data:image/png;base64,${result.mask}`
 
     return () => { cancelled = true }
-  }, [result, activeTab, intensityMin, intensityMax, showClasses])
+  }, [result, activeTab, intensityMin, intensityMax, showClasses, circleMask, circleOverlayOpacity])
 
   const handlePredict = async () => {
     if (!selectedModel || !selectedSample) return
@@ -140,6 +206,15 @@ export default function App() {
           split_grid: splitGrid,
           confidence_threshold: confidenceThreshold,
           show_classes: ['crack', 'shape'],
+          close_gap_size: closeGapSize,
+          min_crack_area: minCrackArea,
+          max_circularity: maxCircularity,
+          circle_mask: circleMask,
+          circle_mask_margin: circleMaskMargin,
+          circle_mask_offset_x: circleMaskOffsetX,
+          circle_mask_offset_y: circleMaskOffsetY,
+          intensity_min: intensityMin,
+          intensity_max: intensityMax,
         }),
       })
 
@@ -156,6 +231,7 @@ export default function App() {
 
       const data = await res.json()
       setResult(data)
+      hasResultRef.current = true
       setActiveTab('overlay')
       setIntensityMin(0)
       setIntensityMax(255)
@@ -312,6 +388,220 @@ export default function App() {
               only high-confidence predictions.
             </p>
           </Section>
+
+          <div className="filter-section-divider" />
+
+          <Section label="Crack Post-Processing">
+            <p className="hint" style={{ marginBottom: 6 }}>
+              Filters applied to crack predictions only — removes blobs and noise,
+              keeps linear structures. Updates instantly after predict.
+            </p>
+
+            {/* 1. Intensity filter */}
+            <div className="filter-row">
+              <div className="intensity-header">
+                <span className="filter-label">Intensity Range</span>
+                <span className="filter-value">{intensityMin} – {intensityMax}</span>
+              </div>
+              <div className="intensity-range-wrap">
+                <div className="intensity-track">
+                  <div className="intensity-fill" style={{
+                    left: `${(intensityMin / 255) * 100}%`,
+                    width: `${((intensityMax - intensityMin) / 255) * 100}%`,
+                  }} />
+                </div>
+                <input type="range" min="0" max="255" value={intensityMin}
+                  onChange={(e) => setIntensityMin(Math.min(+e.target.value, intensityMax - 1))}
+                  disabled={loading}
+                  className="intensity-slider" />
+                <input type="range" min="0" max="255" value={intensityMax}
+                  onChange={(e) => setIntensityMax(Math.max(+e.target.value, intensityMin + 1))}
+                  disabled={loading}
+                  className="intensity-slider" />
+              </div>
+              <div className="intensity-labels">
+                <span>Dark (0)</span>
+                <span>Bright (255)</span>
+              </div>
+              <p className="hint" style={{ marginTop: 4 }}>
+                Only keep crack labels where the underlying pixel brightness is
+                within this range. Runs first — before gap-closing and area filters.
+              </p>
+            </div>
+
+            {/* 2. Gap closing */}
+            <div className="filter-row">
+              <div className="filter-row-header">
+                <span className="filter-label">Connect Gaps</span>
+                <span className="filter-value">{closeGapSize === 0 ? 'off' : `r=${closeGapSize}`}</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="15"
+                step="1"
+                value={closeGapSize}
+                onChange={(e) => setCloseGapSize(parseInt(e.target.value))}
+                disabled={loading}
+                className="threshold-slider"
+              />
+              <div className="threshold-labels">
+                <span>Off</span>
+                <span>r=15</span>
+              </div>
+              <p className="hint">
+                Merges crack segments that are within this radius of each other — runs
+                before other filters so nearby spots survive the area/circularity gates.
+              </p>
+            </div>
+
+            {/* 3. Min area */}
+            <div className="filter-row">
+              <div className="filter-row-header">
+                <span className="filter-label">Min Crack Area</span>
+                <span className="filter-value">{minCrackArea === 0 ? 'off' : `${minCrackArea} px`}</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="500"
+                step="5"
+                value={minCrackArea}
+                onChange={(e) => setMinCrackArea(parseInt(e.target.value))}
+                disabled={loading}
+                className="threshold-slider"
+              />
+              <div className="threshold-labels">
+                <span>Off</span>
+                <span>500 px</span>
+              </div>
+              <p className="hint">
+                Discard connected components smaller than this pixel area — removes tiny spots.
+              </p>
+            </div>
+
+            {/* 4. Circularity */}
+            <div className="filter-row">
+              <div className="filter-row-header">
+                <span className="filter-label">Max Circularity</span>
+                <span className="filter-value">{maxCircularity >= 1.0 ? 'off' : maxCircularity.toFixed(2)}</span>
+              </div>
+              <input
+                type="range"
+                min="0.0"
+                max="1.0"
+                step="0.05"
+                value={maxCircularity}
+                onChange={(e) => setMaxCircularity(parseFloat(e.target.value))}
+                disabled={loading}
+                className="threshold-slider"
+              />
+              <div className="threshold-labels">
+                <span>Strict (0.0)</span>
+                <span>Off (1.0)</span>
+              </div>
+              <p className="hint">
+                Discard components where circularity (4π·area/perimeter²) exceeds this value.
+                Round blobs score ≈1.0; cracks, lines, and crack networks (crosses, grids) score
+                much lower and are always preserved.
+              </p>
+            </div>
+
+            {/* 5. Circle mask */}
+            <div className="filter-row">
+              <div className="toggle-row">
+                <span className="filter-label">Circle Sample Mask</span>
+                <button
+                  className={`toggle ${circleMask ? 'toggle-on' : ''}`}
+                  onClick={() => setCircleMask((v) => !v)}
+                  disabled={loading}
+                  aria-pressed={circleMask}
+                >
+                  <span className="toggle-thumb" />
+                </button>
+              </div>
+              <p className="hint">
+                Auto-detects the circular sample boundary and removes all crack
+                labels outside it.
+              </p>
+              {circleMask && (
+                <>
+                  <div className="filter-row-header" style={{ marginTop: 8 }}>
+                    <span className="filter-label">Offset X</span>
+                    <span className="filter-value">{circleMaskOffsetX > 0 ? `+${circleMaskOffsetX}` : circleMaskOffsetX} px</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="-200"
+                    max="200"
+                    step="5"
+                    value={circleMaskOffsetX}
+                    onChange={(e) => setCircleMaskOffsetX(parseInt(e.target.value))}
+                    disabled={loading}
+                    className="threshold-slider"
+                  />
+                  <div className="threshold-labels">
+                    <span>← Left</span>
+                    <span>Right →</span>
+                  </div>
+                  <div className="filter-row-header" style={{ marginTop: 8 }}>
+                    <span className="filter-label">Offset Y</span>
+                    <span className="filter-value">{circleMaskOffsetY > 0 ? `+${circleMaskOffsetY}` : circleMaskOffsetY} px</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="-200"
+                    max="200"
+                    step="5"
+                    value={circleMaskOffsetY}
+                    onChange={(e) => setCircleMaskOffsetY(parseInt(e.target.value))}
+                    disabled={loading}
+                    className="threshold-slider"
+                  />
+                  <div className="threshold-labels">
+                    <span>↑ Up</span>
+                    <span>Down ↓</span>
+                  </div>
+                  <div className="filter-row-header" style={{ marginTop: 8 }}>
+                    <span className="filter-label">Circle Margin</span>
+                    <span className="filter-value">{circleMaskMargin > 0 ? `+${circleMaskMargin}` : circleMaskMargin} px</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="-100"
+                    max="100"
+                    step="5"
+                    value={circleMaskMargin}
+                    onChange={(e) => setCircleMaskMargin(parseInt(e.target.value))}
+                    disabled={loading}
+                    className="threshold-slider"
+                  />
+                  <div className="threshold-labels">
+                    <span>Shrink (−100)</span>
+                    <span>Expand (+100)</span>
+                  </div>
+                  <div className="filter-row-header" style={{ marginTop: 8 }}>
+                    <span className="filter-label">Outside Opacity</span>
+                    <span className="filter-value">{Math.round(circleOverlayOpacity * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={circleOverlayOpacity}
+                    onChange={(e) => setCircleOverlayOpacity(parseFloat(e.target.value))}
+                    disabled={loading}
+                    className="threshold-slider"
+                  />
+                  <div className="threshold-labels">
+                    <span>Transparent</span>
+                    <span>Opaque</span>
+                  </div>
+                </>
+              )}
+            </div>
+          </Section>
           </div>
 
           <div className="predict-btn-wrap">
@@ -354,7 +644,7 @@ export default function App() {
 
           {result && !loading && (
             <div className="result-wrap">
-              {/* Stats row */}}
+              {/* Stats row */}
               <div className="stats-row">
                 <StatCard label="Crack Coverage" value={`${result.stats.line_percentage.toFixed(2)}%`} accent="var(--red)" />
                 <StatCard label="Shape Coverage" value={`${result.stats.shape_percentage.toFixed(2)}%`} accent="var(--gold)" />
@@ -378,34 +668,7 @@ export default function App() {
                 </span>
               </div>
 
-              {/* Intensity filter */}
-              <div className="intensity-section">
-                <div className="intensity-header">
-                  <span className="intensity-title">Intensity Filter</span>
-                  <span className="intensity-value">{intensityMin} – {intensityMax}</span>
-                </div>
-                <div className="intensity-range-wrap">
-                  <div className="intensity-track">
-                    <div className="intensity-fill" style={{
-                      left: `${(intensityMin / 255) * 100}%`,
-                      width: `${((intensityMax - intensityMin) / 255) * 100}%`,
-                    }} />
-                  </div>
-                  <input type="range" min="0" max="255" value={intensityMin}
-                    onChange={(e) => setIntensityMin(Math.min(+e.target.value, intensityMax - 1))}
-                    className="intensity-slider" />
-                  <input type="range" min="0" max="255" value={intensityMax}
-                    onChange={(e) => setIntensityMax(Math.max(+e.target.value, intensityMin + 1))}
-                    className="intensity-slider" />
-                </div>
-                <div className="intensity-labels">
-                  <span>Dark (0)</span>
-                  <span>Bright (255)</span>
-                </div>
-                <p className="hint" style={{ marginTop: '6px' }}>
-                  Only show labeled pixels where the original pixel intensity is within this range. Updates instantly without re-predicting.
-                </p>
-              </div>
+              {/* Intensity filter — now in sidebar post-processing section */}
 
               {/* Image viewer */}
               <div className="viewer">

@@ -3,7 +3,7 @@ import os
 import base64
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -47,7 +47,7 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 # instead of running PyTorch locally.
 # Set USE_LOCAL_INFERENCE = True to force local PyTorch regardless of SAGEMAKER_ENDPOINT.
 # ---------------------------------------------------------------------------
-USE_LOCAL_INFERENCE  = False  # ← change to True to force local PyTorch
+USE_LOCAL_INFERENCE  = True  # ← change to True to force local PyTorch
 
 _SAGEMAKER_ENDPOINT  = os.environ.get("SAGEMAKER_ENDPOINT", "").strip()
 _SAGEMAKER_REGION    = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
@@ -176,6 +176,12 @@ for _mod_name in ("__main__", "__mp_main__"):
 # ---------------------------------------------------------------------------
 _model_cache: dict[str, nn.Module] = {}
 
+# ---------------------------------------------------------------------------
+# Filter cache — stores the raw (unfiltered) mask + image from the last /predict
+# so that /filter can re-apply post-processing without re-running inference.
+# ---------------------------------------------------------------------------
+_filter_cache: dict = {}
+
 
 def _build_model_from_state_dict(state_dict: dict) -> nn.Module:
     """Instantiate the correct architecture by inspecting state dict keys."""
@@ -302,6 +308,149 @@ def _predict_split(
     return full_mask
 
 
+def _apply_intensity_filter(
+    mask: np.ndarray,
+    img_gray: np.ndarray,
+    intensity_min: int = 0,
+    intensity_max: int = 255,
+) -> np.ndarray:
+    """Zero out mask pixels whose underlying grayscale intensity is outside [min, max]."""
+    if intensity_min <= 0 and intensity_max >= 255:
+        return mask  # fast path
+    result = mask.copy()
+    out_of_range = (img_gray < intensity_min) | (img_gray > intensity_max)
+    result[out_of_range] = 0
+    return result
+
+
+def _postprocess_crack_mask(
+    mask: np.ndarray,
+    close_gap_size: int = 0,
+    min_crack_area: int = 0,
+    max_circularity: float = 1.0,
+) -> np.ndarray:
+    """Filter crack (LINE_CLASS) pixels to suppress noise and keep linear structures.
+
+    Parameters
+    ----------
+    close_gap_size:
+        Radius of the elliptical structuring element for morphological closing
+        (dilate then erode).  Bridges gaps between nearby crack segments so
+        that close-together spots merge into one connected component before
+        the area/circularity filters run.  0 = disabled.
+    min_crack_area:
+        Discard connected components (8-connectivity) whose pixel area is
+        below this value.  0 = disabled.
+    max_circularity:
+        Discard components whose circularity (4π·area/perimeter²) exceeds this
+        value.  A perfect circle = 1.0; any elongated line or crack network
+        (including cross/plus shapes) scores far below 1.0.  1.0 = disabled.
+    """
+    if close_gap_size <= 0 and min_crack_area <= 0 and max_circularity >= 1.0:
+        return mask  # fast path – nothing to do
+
+    crack_binary = (mask == LINE_CLASS).astype(np.uint8)
+
+    # 1. Gap closing — dilate to find nearby segments, then fill the bridge.
+    #    Any dilated component that contains at least one original crack pixel
+    #    is kept in full (including the bridging pixels), connecting the gaps.
+    if close_gap_size > 0:
+        k = close_gap_size * 2 + 1  # radius → kernel size
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        dilated = cv2.dilate(crack_binary, kernel)
+        num_labels, labels, _, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+        merged = np.zeros_like(crack_binary)
+        for lid in range(1, num_labels):
+            comp_pixels = labels == lid
+            if (crack_binary[comp_pixels] > 0).any():  # component touches a real crack pixel
+                merged[comp_pixels] = 1  # fill the whole component, including bridge pixels
+        crack_binary = merged
+
+    # 2. Per-component area + circularity filtering
+    if min_crack_area > 0 or max_circularity < 1.0:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            crack_binary, connectivity=8
+        )
+        keep = np.zeros_like(crack_binary)
+        for label_id in range(1, num_labels):  # 0 = background
+            area = int(stats[label_id, cv2.CC_STAT_AREA])
+            # Area gate — CC_STAT_AREA counts actual crack pixels, never fills holes
+            if min_crack_area > 0 and area < min_crack_area:
+                continue
+            # Circularity gate: 4π·area/perimeter²
+            #   circle ≈ 1.0  |  thin line or crack network << 1.0
+            #   Cross/plus shapes also score low because their perimeter is large
+            #   relative to enclosed area — they are correctly preserved.
+            if max_circularity < 1.0:
+                comp_mask = (labels == label_id).astype(np.uint8)
+                cnts, _ = cv2.findContours(
+                    comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                if cnts:
+                    perimeter = sum(cv2.arcLength(c, True) for c in cnts)
+                    if perimeter > 0:
+                        circularity = 4 * np.pi * area / (perimeter ** 2)
+                        if circularity > max_circularity:
+                            continue  # too blob-like → discard
+            keep[labels == label_id] = 1  # copy only the original pixels
+        crack_binary = keep
+
+    result = mask.copy()
+    result[mask == LINE_CLASS] = 0          # clear original crack pixels
+    result[crack_binary == 1] = LINE_CLASS  # restore only the kept ones
+    return result
+
+
+def _detect_sample_circle(
+    img_gray: np.ndarray,
+) -> Optional[Tuple[int, int, int]]:
+    """Detect the dominant circular sample boundary using Hough circles.
+
+    Returns (cx, cy, radius) in original image pixels, or None if not found.
+    """
+    h, w = img_gray.shape
+    min_dim = min(h, w)
+    # Blur strongly to suppress texture noise; only the bold circle edge survives
+    blurred = cv2.GaussianBlur(img_gray, (5, 5), 1)
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1,
+        minDist=min_dim // 2,           # expect at most one dominant circle
+        param1=80,                       # Canny high threshold
+        param2=35,                       # accumulator threshold (lower = more detections)
+        minRadius=min_dim // 5,          # ignore tiny circles
+        maxRadius=int(min_dim * 0.65),   # ignore circles larger than the image
+    )
+    if circles is None:
+        return None
+    circles = np.round(circles[0]).astype(int)
+    # Return the largest detected circle
+    best = circles[np.argmax(circles[:, 2])]
+    return int(best[0]), int(best[1]), int(best[2])
+
+
+def _apply_circle_mask(
+    mask: np.ndarray,
+    circle: tuple[int, int, int],
+    margin: int = 0,
+    offset_x: int = 0,
+    offset_y: int = 0,
+) -> np.ndarray:
+    """Zero out mask pixels that fall outside the detected circle.
+
+    margin > 0 expands the circle, margin < 0 shrinks it.
+    offset_x/y shift the circle centre in pixels.
+    """
+    cx, cy, r = circle
+    r_adj = max(1, r + margin)
+    circle_region = np.zeros(mask.shape, dtype=np.uint8)
+    cv2.circle(circle_region, (cx + offset_x, cy + offset_y), r_adj, 1, thickness=-1)
+    result = mask.copy()
+    result[circle_region == 0] = 0
+    return result
+
+
 def _create_overlay(img_gray: np.ndarray, mask: np.ndarray, alpha: float = 0.4) -> np.ndarray:
     img_bgr = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
     overlay = img_bgr.copy()
@@ -343,6 +492,15 @@ class PredictRequest(BaseModel):
     split_grid: int = 2
     confidence_threshold: float = 0.5
     show_classes: list[str] = ["crack", "shape"]
+    close_gap_size: int = 0
+    min_crack_area: int = 0
+    max_circularity: float = 1.0
+    circle_mask: bool = False
+    circle_mask_margin: int = 0
+    circle_mask_offset_x: int = 0
+    circle_mask_offset_y: int = 0
+    intensity_min: int = 0
+    intensity_max: int = 255
 
     @field_validator("resolution")
     @classmethod
@@ -374,6 +532,133 @@ class PredictRequest(BaseModel):
                 raise ValueError(f"show_classes items must be one of {valid}")
         return v
 
+    @field_validator("close_gap_size")
+    @classmethod
+    def validate_close_gap_size(cls, v: int) -> int:
+        if not 0 <= v <= 15:
+            raise ValueError("close_gap_size must be 0–15")
+        return v
+
+    @field_validator("min_crack_area")
+    @classmethod
+    def validate_min_crack_area(cls, v: int) -> int:
+        if not 0 <= v <= 5000:
+            raise ValueError("min_crack_area must be 0–5000")
+        return v
+
+    @field_validator("max_circularity")
+    @classmethod
+    def validate_max_circularity(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("max_circularity must be 0.0–1.0")
+        return v
+
+    @field_validator("circle_mask_margin")
+    @classmethod
+    def validate_circle_mask_margin(cls, v: int) -> int:
+        if not -200 <= v <= 200:
+            raise ValueError("circle_mask_margin must be -200–200")
+        return v
+
+    @field_validator("circle_mask_offset_x")
+    @classmethod
+    def validate_circle_mask_offset_x(cls, v: int) -> int:
+        if not -500 <= v <= 500:
+            raise ValueError("circle_mask_offset_x must be -500–500")
+        return v
+
+    @field_validator("circle_mask_offset_y")
+    @classmethod
+    def validate_circle_mask_offset_y(cls, v: int) -> int:
+        if not -500 <= v <= 500:
+            raise ValueError("circle_mask_offset_y must be -500–500")
+        return v
+
+    @field_validator("intensity_min")
+    @classmethod
+    def validate_intensity_min(cls, v: int) -> int:
+        if not 0 <= v <= 255:
+            raise ValueError("intensity_min must be 0–255")
+        return v
+
+    @field_validator("intensity_max")
+    @classmethod
+    def validate_intensity_max(cls, v: int) -> int:
+        if not 0 <= v <= 255:
+            raise ValueError("intensity_max must be 0–255")
+        return v
+
+
+# ---------------------------------------------------------------------------
+# Filter request/response models
+# ---------------------------------------------------------------------------
+class FilterRequest(BaseModel):
+    close_gap_size: int = 0
+    min_crack_area: int = 0
+    max_circularity: float = 1.0
+    circle_mask: bool = False
+    circle_mask_margin: int = 0
+    circle_mask_offset_x: int = 0
+    circle_mask_offset_y: int = 0
+    intensity_min: int = 0
+    intensity_max: int = 255
+
+    @field_validator("close_gap_size")
+    @classmethod
+    def validate_close_gap_size(cls, v: int) -> int:
+        if not 0 <= v <= 15:
+            raise ValueError("close_gap_size must be 0–15")
+        return v
+
+    @field_validator("min_crack_area")
+    @classmethod
+    def validate_min_crack_area(cls, v: int) -> int:
+        if not 0 <= v <= 5000:
+            raise ValueError("min_crack_area must be 0–5000")
+        return v
+
+    @field_validator("max_circularity")
+    @classmethod
+    def validate_max_circularity(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("max_circularity must be 0.0–1.0")
+        return v
+
+    @field_validator("circle_mask_margin")
+    @classmethod
+    def validate_circle_mask_margin(cls, v: int) -> int:
+        if not -200 <= v <= 200:
+            raise ValueError("circle_mask_margin must be -200–200")
+        return v
+
+    @field_validator("circle_mask_offset_x")
+    @classmethod
+    def validate_circle_mask_offset_x(cls, v: int) -> int:
+        if not -500 <= v <= 500:
+            raise ValueError("circle_mask_offset_x must be -500–500")
+        return v
+
+    @field_validator("circle_mask_offset_y")
+    @classmethod
+    def validate_circle_mask_offset_y(cls, v: int) -> int:
+        if not -500 <= v <= 500:
+            raise ValueError("circle_mask_offset_y must be -500–500")
+        return v
+
+    @field_validator("intensity_min")
+    @classmethod
+    def validate_intensity_min(cls, v: int) -> int:
+        if not 0 <= v <= 255:
+            raise ValueError("intensity_min must be 0–255")
+        return v
+
+    @field_validator("intensity_max")
+    @classmethod
+    def validate_intensity_max(cls, v: int) -> int:
+        if not 0 <= v <= 255:
+            raise ValueError("intensity_max must be 0–255")
+        return v
+
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -382,6 +667,64 @@ class PredictRequest(BaseModel):
 def health():
     mode = "sagemaker" if _SAGEMAKER_ENDPOINT else "local"
     return {"status": "ok", "device": str(DEVICE), "inference_mode": mode}
+
+
+@app.post("/filter")
+def apply_filter(req: FilterRequest):
+    """Re-apply post-processing to the cached raw mask from the last /predict call.
+    Returns updated mask, overlay and stats without re-running model inference.
+    """
+    if "raw_mask" not in _filter_cache:
+        raise HTTPException(
+            status_code=400,
+            detail="No prediction cached. Run /predict first.",
+        )
+
+    img_gray = _filter_cache["img_gray"]
+    mask = _filter_cache["raw_mask"].copy()
+
+    # 1. Intensity filter — first step: remove predictions on pixels outside the brightness range
+    mask = _apply_intensity_filter(mask, img_gray, req.intensity_min, req.intensity_max)
+
+    # 2. Circle mask
+    if req.circle_mask:
+        circle = _filter_cache.get("circle")
+        if circle is not None:
+            mask = _apply_circle_mask(mask, circle, req.circle_mask_margin, req.circle_mask_offset_x, req.circle_mask_offset_y)
+
+    mask = _postprocess_crack_mask(
+        mask, req.close_gap_size, req.min_crack_area, req.max_circularity
+    )
+
+    overlay_bgr = _create_overlay(img_gray, mask, alpha=0.4)
+    mask_rgb    = _mask_to_color_rgb(mask)
+
+    total     = mask.size
+    line_pct  = float((mask == LINE_CLASS).sum()  / total * 100)
+    shape_pct = float((mask == SHAPE_CLASS).sum() / total * 100)
+
+    raw_circle = _filter_cache.get("circle")
+    circle_out = (
+        {"cx": int(raw_circle[0] + req.circle_mask_offset_x), "cy": int(raw_circle[1] + req.circle_mask_offset_y), "radius": int(raw_circle[2] + req.circle_mask_margin)}
+        if raw_circle is not None else None
+    )
+
+    return {
+        "mask":    _ndarray_to_base64(mask_rgb, is_bgr=False),
+        "overlay": _ndarray_to_base64(overlay_bgr, is_bgr=True),
+        "circle":  circle_out,
+        "stats": {
+            "line_percentage":   round(line_pct,  3),
+            "shape_percentage":  round(shape_pct, 3),
+            "defect_percentage": round(line_pct + shape_pct, 3),
+            "has_crack":  line_pct  > 0.1,
+            "has_shape":  shape_pct > 0.1,
+            "image_size": {
+                "width":  int(img_gray.shape[1]),
+                "height": int(img_gray.shape[0]),
+            },
+        },
+    }
 
 
 @app.get("/models")
@@ -468,6 +811,26 @@ def predict(req: PredictRequest):
         else:
             mask = _predict_whole(model, img_gray, req.resolution, req.confidence_threshold)
 
+        # Cache the raw mask (before any post-processing) so /filter can reuse it
+        _filter_cache["img_gray"] = img_gray
+        _filter_cache["raw_mask"] = mask.copy()
+        # Detect and cache the sample circle (used by circle-mask feature)
+        _filter_cache["circle"] = _detect_sample_circle(img_gray)
+
+        # 1. Intensity filter — first step
+        mask = _apply_intensity_filter(mask, img_gray, req.intensity_min, req.intensity_max)
+
+        # 2. Circle mask
+        if req.circle_mask:
+            circle = _filter_cache.get("circle")
+            if circle is not None:
+                mask = _apply_circle_mask(mask, circle, req.circle_mask_margin, req.circle_mask_offset_x, req.circle_mask_offset_y)
+
+        # Post-process crack channel
+        mask = _postprocess_crack_mask(
+            mask, req.close_gap_size, req.min_crack_area, req.max_circularity
+        )
+
         # Apply class filter
         if "crack" not in req.show_classes:
             mask[mask == LINE_CLASS]  = 0
@@ -481,10 +844,17 @@ def predict(req: PredictRequest):
         line_pct  = float((mask == LINE_CLASS).sum()  / total * 100)
         shape_pct = float((mask == SHAPE_CLASS).sum() / total * 100)
 
+        raw_circle = _filter_cache.get("circle")
+        circle_out = (
+            {"cx": int(raw_circle[0] + req.circle_mask_offset_x), "cy": int(raw_circle[1] + req.circle_mask_offset_y), "radius": int(raw_circle[2] + req.circle_mask_margin)}
+            if raw_circle is not None else None
+        )
+
         return {
             "original": _ndarray_to_base64(cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR), is_bgr=True),
             "mask":     _ndarray_to_base64(mask_rgb, is_bgr=False),
             "overlay":  _ndarray_to_base64(overlay_bgr, is_bgr=True),
+            "circle":   circle_out,
             "stats": {
                 "line_percentage":   round(line_pct,  3),
                 "shape_percentage":  round(shape_pct, 3),
