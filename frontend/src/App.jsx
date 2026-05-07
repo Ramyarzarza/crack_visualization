@@ -125,7 +125,9 @@ export default function App() {
         canvas.height = img.naturalHeight
         ctx.drawImage(img, 0, 0)
         if (circleMask && result.circle && circleOverlayOpacity > 0) {
-          drawCircleOverlay(ctx, canvas.width, canvas.height, result.circle, circleOverlayOpacity)
+          const imgScale = canvas.width / result.stats.image_size.width
+          const scaledCircle = { cx: result.circle.cx * imgScale, cy: result.circle.cy * imgScale, radius: result.circle.radius * imgScale }
+          drawCircleOverlay(ctx, canvas.width, canvas.height, scaledCircle, circleOverlayOpacity)
         }
       }
       img.src = `data:image/png;base64,${result.original}`
@@ -182,7 +184,9 @@ export default function App() {
       }
       ctx.putImageData(out, 0, 0)
       if (circleMask && result.circle && circleOverlayOpacity > 0) {
-        drawCircleOverlay(ctx, w, h, result.circle, circleOverlayOpacity)
+        const imgScale = w / result.stats.image_size.width
+        const scaledCircle = { cx: result.circle.cx * imgScale, cy: result.circle.cy * imgScale, radius: result.circle.radius * imgScale }
+        drawCircleOverlay(ctx, w, h, scaledCircle, circleOverlayOpacity)
       }
     }
 
