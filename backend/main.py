@@ -83,8 +83,15 @@ import sys as _sys_path_setup
 if str(BASE_DIR) not in _sys_path_setup.path:
     _sys_path_setup.path.insert(0, str(BASE_DIR))
 from U_net import UNet, DownConv, UpConv
-MODELS_DIR = BASE_DIR / "Models"
-SAMPLES_DIR = BASE_DIR / "samples"
+MODELS_DIR    = BASE_DIR / "Models"
+SAMPLES_DIR   = BASE_DIR / "samples"
+LABELING_DIR  = BASE_DIR / "Labeling"
+LABEL_IMAGES_DIR = LABELING_DIR / "Images"
+LABEL_MASKS_DIR  = LABELING_DIR / "Masks"
+
+# Ensure labeling directories exist at startup
+LABEL_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+LABEL_MASKS_DIR.mkdir(parents=True, exist_ok=True)
 
 BACKGROUND_INDEX = 0
 LINE_INDEX = 1
@@ -879,3 +886,134 @@ def predict(req: PredictRequest):
                 "image_size": {"width": int(img_gray.shape[1]), "height": int(img_gray.shape[0])},
             },
         }
+
+
+# ---------------------------------------------------------------------------
+# Labeling endpoints
+# ---------------------------------------------------------------------------
+
+class SaveMaskRequest(BaseModel):
+    filename: str               # must match a file in Labeling/Images
+    mask: str                   # base64-encoded PNG — raw mask (no filters), used for reloading
+    mask_filtered: Optional[str] = None  # base64-encoded PNG — post-processed mask (with filters applied)
+
+
+class DenoiseRequest(BaseModel):
+    mask: str       # base64-encoded grayscale PNG
+    min_area: int = 100
+
+    @field_validator("min_area")
+    @classmethod
+    def validate_min_area(cls, v: int) -> int:
+        if not 0 <= v <= 100:
+            raise ValueError("min_area must be 0–100")
+        return v
+
+
+@app.post("/labeling/denoise")
+def labeling_denoise(req: DenoiseRequest):
+    """Remove connected components smaller than min_area from a label mask."""
+    try:
+        img_bytes = base64.b64decode(req.mask)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 mask data")
+
+    arr  = np.frombuffer(img_bytes, dtype=np.uint8)
+    mask = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise HTTPException(status_code=400, detail="Could not decode mask image")
+
+    if req.min_area > 0:
+        result = mask.copy()
+        for class_value in (LINE_CLASS, SHAPE_CLASS):
+            binary = (mask == class_value).astype(np.uint8)
+            if not binary.any():
+                continue
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                binary, connectivity=8
+            )
+            keep = np.zeros_like(binary)
+            for lid in range(1, num_labels):
+                if int(stats[lid, cv2.CC_STAT_AREA]) >= req.min_area:
+                    keep[labels == lid] = 1
+            result[mask == class_value] = 0
+            result[keep == 1] = class_value
+        mask = result
+
+    success, buf = cv2.imencode(".png", mask)
+    if not success:
+        raise HTTPException(status_code=500, detail="Could not encode mask")
+    return {"mask": base64.b64encode(buf.tobytes()).decode("utf-8")}
+
+
+@app.get("/labeling/images")
+def labeling_list_images():
+    """List images available for labeling in Labeling/Images."""
+    images = sorted(
+        f for f in os.listdir(LABEL_IMAGES_DIR)
+        if Path(f).suffix.lower() in IMAGE_EXTENSIONS
+    )
+    return {"images": images}
+
+
+@app.get("/labeling/image/{filename}")
+def labeling_get_image(filename: str):
+    """Return a labeling image as base64 PNG at its original resolution (no downscaling)."""
+    safe_name = Path(filename).name
+    img_path = LABEL_IMAGES_DIR / safe_name
+    if not img_path.exists():
+        raise HTTPException(status_code=404, detail=f"Image not found: {safe_name}")
+    img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise HTTPException(status_code=500, detail="Could not read image")
+    h, w = img.shape
+    success, buf = cv2.imencode(".png", img)
+    if not success:
+        raise HTTPException(status_code=500, detail="Could not encode image")
+    encoded = base64.b64encode(buf.tobytes()).decode("utf-8")
+    return {"image": encoded, "width": w, "height": h}
+
+
+@app.get("/labeling/mask/{filename}")
+def labeling_get_mask(filename: str):
+    """Return the existing mask for an image, or null if none exists."""
+    safe_name = Path(filename).name
+    mask_path = LABEL_MASKS_DIR / f"{Path(safe_name).stem}_mask.png"
+    if not mask_path.exists():
+        return {"mask": None}
+    with open(mask_path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode()
+    return {"mask": encoded}
+
+
+@app.post("/labeling/save")
+def labeling_save_mask(req: SaveMaskRequest):
+    """Save raw and filtered mask PNGs to Labeling/Masks."""
+    safe_name = Path(req.filename).name
+    if not (LABEL_IMAGES_DIR / safe_name).exists():
+        raise HTTPException(status_code=404, detail=f"Image not found: {safe_name}")
+
+    stem = Path(safe_name).stem
+
+    # Save raw mask (used for reloading)
+    raw_path = LABEL_MASKS_DIR / f"{stem}_mask.png"
+    try:
+        raw_bytes = base64.b64decode(req.mask)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 mask data")
+    with open(raw_path, "wb") as f:
+        f.write(raw_bytes)
+
+    # Save filtered mask if provided
+    saved = [raw_path.name]
+    if req.mask_filtered is not None:
+        filtered_path = LABEL_MASKS_DIR / f"{stem}_mask_filtered.png"
+        try:
+            filtered_bytes = base64.b64decode(req.mask_filtered)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid base64 mask_filtered data")
+        with open(filtered_path, "wb") as f:
+            f.write(filtered_bytes)
+        saved.append(filtered_path.name)
+
+    return {"saved": saved}

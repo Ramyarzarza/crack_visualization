@@ -55,10 +55,14 @@ echo "    Frontend running on http://localhost:5173 (PID $FRONTEND_PID)"
 # ── Cleanup on exit ───────────────────────────────────────────────────────────
 trap "echo ''; echo 'Stopping servers...'; kill $BACKEND_PID $FRONTEND_PID 2>/dev/null" EXIT INT TERM
 
+# Detect LAN IP
+LAN_IP=$(ipconfig getifaddr en0 2>/dev/null || ip route get 1 2>/dev/null | awk '{print $7; exit}' || echo "<your-local-ip>")
+
 echo ""
 echo "======================================================"
-echo "  App running at:  http://localhost:5173"
-echo "  API docs at:     http://localhost:8000/docs"
+echo "  Local:    http://localhost:5173"
+echo "  Network:  http://$LAN_IP:5173"
+echo "  API docs: http://localhost:8000/docs"
 echo "  Press Ctrl+C to stop both servers."
 echo "======================================================"
 

@@ -253,25 +253,19 @@ export default function App() {
   }
 
   return (
-    <div className="app">
-      {/* ── Header ── */}
-      <header className="header">
-        <div className="header-inner">
-          <div>
-            <h1 className="header-title">Crack Detection</h1>
-            <p className="header-sub">UNet-based segmentation — select options and predict</p>
+    <div className="app-inner">
+      {/* Status badges in a slim subheader */}
+      {result && (
+        <div className="subheader">
+          <div className="header-badges">
+            {result.stats.has_crack && <span className="badge crack-badge">Crack detected</span>}
+            {result.stats.has_shape && <span className="badge shape-badge">Shape detected</span>}
+            {!result.stats.has_crack && !result.stats.has_shape && (
+              <span className="badge ok-badge">No defects</span>
+            )}
           </div>
-          {result && (
-            <div className="header-badges">
-              {result.stats.has_crack && <span className="badge crack-badge">Crack detected</span>}
-              {result.stats.has_shape && <span className="badge shape-badge">Shape detected</span>}
-              {!result.stats.has_crack && !result.stats.has_shape && (
-                <span className="badge ok-badge">No defects</span>
-              )}
-            </div>
-          )}
         </div>
-      </header>
+      )}
 
       <div className="layout">
         {/* ── Sidebar ── */}

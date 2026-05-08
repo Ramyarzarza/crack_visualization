@@ -27,6 +27,241 @@ body {
 
 /* ── App shell ── */
 .app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+.app-inner { display: flex; flex-direction: column; flex: 1; overflow: hidden; min-height: 0; }
+
+/* ── Top navigation ── */
+.top-nav {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 0 28px;
+  height: 52px;
+  flex-shrink: 0;
+}
+.top-nav-brand {
+  font-size: 1rem;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: -0.02em;
+  margin-right: auto;
+}
+.top-nav-links { display: flex; gap: 4px; }
+.top-nav-link {
+  padding: 6px 16px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--muted);
+  text-decoration: none;
+  border-radius: var(--radius);
+  transition: color 0.15s, background 0.15s;
+}
+.top-nav-link:hover        { color: var(--text); background: var(--surface2); }
+.top-nav-link-active       { color: var(--blue); background: rgba(78,158,255,.1); }
+
+/* Slim subheader for inference badges */
+.subheader {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 28px;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+/* ── Labeler page ── */
+.labeler-page {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.labeler-sidebar {
+  width: 260px;
+  min-width: 260px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.labeler-sidebar-scroll {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px 14px 12px;
+}
+
+.lab-section { display: flex; flex-direction: column; gap: 8px; }
+.lab-section-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+/* Image list */
+.lab-image-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.lab-empty { font-size: 0.78rem; color: var(--muted); padding: 6px 0; }
+.lab-image-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  padding: 7px 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 0.8rem;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s;
+  overflow: hidden;
+}
+.lab-image-item:hover:not(:disabled) { border-color: #44485a; }
+.lab-image-item-active               { border-color: var(--blue); color: var(--blue); background: rgba(78,158,255,.08); }
+.lab-image-item:disabled             { opacity: 0.5; cursor: not-allowed; }
+.lab-image-name                      { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.lab-mask-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  flex-shrink: 0;
+}
+
+/* Class buttons */
+.lab-class-list { display: flex; flex-direction: column; gap: 6px; }
+.lab-class-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.lab-class-btn:hover { border-color: #44485a; }
+.lab-class-btn-active {
+  border-color: var(--class-color);
+  background: color-mix(in srgb, var(--class-color) 12%, transparent);
+  color: #fff;
+}
+.lab-class-dot {
+  width: 12px; height: 12px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.lab-shortcut {
+  margin-left: auto;
+  font-size: 0.68rem;
+  color: var(--muted);
+  background: var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tool buttons */
+.lab-tool-row { display: flex; gap: 6px; }
+.lab-tool-btn {
+  flex: 1;
+  padding: 7px 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--muted);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.lab-tool-btn:hover       { color: var(--text); border-color: #44485a; }
+.lab-tool-btn-active      { border-color: var(--blue); color: var(--blue); background: rgba(78,158,255,.1); }
+
+/* Action buttons */
+.lab-action-row { display: flex; gap: 6px; }
+.lab-action-btn {
+  flex: 1;
+  padding: 7px 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.lab-action-btn:hover             { border-color: #44485a; }
+.lab-action-btn-danger:hover      { border-color: var(--red); color: var(--red); }
+
+.lab-apply-btn {
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: rgba(78,158,255,.12);
+  border: 1px solid var(--blue);
+  border-radius: var(--radius);
+  color: var(--blue);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.lab-apply-btn:hover:not(:disabled) { background: rgba(78,158,255,.22); }
+.lab-apply-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Save button variants */
+.predict-btn-success { background: var(--green) !important; }
+.predict-btn-error   { background: var(--red)   !important; }
+
+/* ── Labeler canvas area ── */
+.labeler-main {
+  flex: 1;
+  background: #0a0b10;
+  overflow: auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 20px;
+  min-height: 0;
+}
+
+.labeler-canvas-wrap {
+  display: inline-flex;
+  position: relative;
+}
+
+.labeler-canvas-stack {
+  position: relative;
+  display: inline-block;
+}
+
+/* All three canvases stack on top of each other */
+.labeler-canvas { display: block; position: absolute; top: 0; left: 0; }
+.labeler-canvas-base  { position: relative; }   /* base takes natural space */
+.labeler-canvas-draw  { cursor: crosshair; }
+.labeler-canvas-mask  { display: none; }         /* hidden — only used for pixel export */
 
 /* ── Header ── */
 .header {
