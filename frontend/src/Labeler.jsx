@@ -4,9 +4,7 @@ const API = import.meta.env.VITE_API_URL ?? '/api'
 
 // Label classes — value is the grayscale pixel value stored in the mask
 const CLASSES = [
-  { id: 'background', label: 'Background', color: '#1e2130', maskValue: 0   },
-  { id: 'crack',      label: 'Crack',      color: '#ff4d4d', maskValue: 255 },
-  { id: 'shape',      label: 'Shape',      color: '#ffd23f', maskValue: 125 },
+  { id: 'crack', label: 'Crack', color: '#ff4d4d', maskValue: 255 },
 ]
 
 const CURSOR_SIZE_SCALE = 1  // canvas-px to screen-px ratio tracking
@@ -17,9 +15,8 @@ const CURSOR_SIZE_SCALE = 1  // canvas-px to screen-px ratio tracking
 
 /** Convert mask grayscale value → RGBA for the overlay canvas */
 function maskValueToRGBA(v) {
-  if (v === 255) return [255, 77,  77,  180]  // crack  — red
-  if (v === 125) return [255, 210, 63,  180]  // shape  — gold
-  return [0, 0, 0, 0]                          // background — transparent
+  if (v === 255) return [255, 77, 77, 180]  // crack — red
+  return [0, 0, 0, 0]                        // background — transparent
 }
 
 // ---------------------------------------------------------------------------
@@ -532,9 +529,7 @@ export default function Labeler() {
       if (e.key === 'e') setTool('eraser')
       if (e.key === 'p') setTool('pan')
       if (e.key === 'v') setShowMask((v) => { const next = !v; showMaskRef.current = next; redrawOverlay(); return next })
-      if (e.key === '1') setActiveClass('background')
-      if (e.key === '2') setActiveClass('crack')
-      if (e.key === '3') setActiveClass('shape')
+      if (e.key === '1') setActiveClass('crack')
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -734,7 +729,7 @@ export default function Labeler() {
 
           {/* Hint */}
           <p className="hint" style={{ padding: '0 4px' }}>
-            Shortcuts: <strong>1/2/3</strong> classes · <strong>B</strong> brush ·
+            Shortcuts: <strong>1</strong> crack · <strong>B</strong> brush ·
             <strong> E</strong> eraser · <strong>P</strong> pan · <strong>V</strong> mask · <strong>⌘Z</strong> undo · <strong>⌘S</strong> save
           </p>
         </div>
@@ -755,6 +750,14 @@ export default function Labeler() {
             ) : (
               'Save Mask'
             )}
+          </button>
+          <button
+            className="predict-btn"
+            style={{ marginTop: 8, background: 'var(--accent2, #4d7fff)' }}
+            onClick={() => { window.location.href = `${API}/labeling/download-zip` }}
+            title="Download all images and masks as a zip"
+          >
+            ⬇ Download All (zip)
           </button>
         </div>
       </aside>

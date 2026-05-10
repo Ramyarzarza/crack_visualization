@@ -2,6 +2,7 @@ import io
 import os
 import base64
 import json
+import zipfile
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -12,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image as PILImage
 from pydantic import BaseModel, field_validator
 
@@ -1017,3 +1018,22 @@ def labeling_save_mask(req: SaveMaskRequest):
         saved.append(filtered_path.name)
 
     return {"saved": saved}
+
+
+@app.get("/labeling/download-zip")
+def labeling_download_zip():
+    """Stream the entire Labeling folder (Images + Masks) as a zip archive."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for folder in (LABEL_IMAGES_DIR, LABEL_MASKS_DIR):
+            if folder.exists():
+                for fpath in sorted(folder.iterdir()):
+                    if fpath.is_file():
+                        arcname = Path("Labeling") / folder.name / fpath.name
+                        zf.write(fpath, arcname)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="Labeling.zip"'},
+    )
