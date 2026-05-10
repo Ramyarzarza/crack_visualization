@@ -54,6 +54,14 @@ export default function App() {
   const [circleOverlayOpacity, setCircleOverlayOpacity] = useState(0.35)
   const hasResultRef = useRef(false)  // guards filter effect from running before first predict
   const canvasRef = useRef(null)
+
+  // Test-set evaluation
+  const [evalResult, setEvalResult]     = useState(null)
+  const [evalLoading, setEvalLoading]   = useState(false)
+  const [evalError, setEvalError]       = useState(null)
+  const [showEvalModal, setShowEvalModal] = useState(false)
+  const [evalPredKind, setEvalPredKind] = useState('filtered_pred')
+  const [evalGtKind,   setEvalGtKind]   = useState('filtered_gt')
   const [viewerHeight, setViewerHeight] = useState(480)
   const dragState = useRef(null)
   const [stripHeight, setStripHeight] = useState(160)
@@ -249,6 +257,45 @@ export default function App() {
       setError(err.message)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const handleEvaluate = async () => {
+    if (!selectedModel) return
+    setEvalLoading(true)
+    setEvalError(null)
+    try {
+      const res = await fetch(`${API}/evaluate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: selectedModel,
+          resolution,
+          split,
+          split_grid: splitGrid,
+          confidence_threshold: confidenceThreshold,
+          close_gap_size: closeGapSize,
+          min_crack_area: minCrackArea,
+          max_circularity: maxCircularity,
+          circle_mask: circleMask,
+          circle_mask_margin: circleMaskMargin,
+          circle_mask_offset_x: circleMaskOffsetX,
+          circle_mask_offset_y: circleMaskOffsetY,
+          intensity_min: intensityMin,
+          intensity_max: intensityMax,
+        }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Evaluation failed')
+      }
+      const data = await res.json()
+      setEvalResult(data)
+      setShowEvalModal(true)
+    } catch (err) {
+      setEvalError(err.message)
+    } finally {
+      setEvalLoading(false)
     }
   }
 
@@ -623,6 +670,21 @@ export default function App() {
               'Predict'
             )}
           </button>
+          <button
+            className="eval-btn"
+            onClick={handleEvaluate}
+            disabled={evalLoading || loading || !selectedModel}
+          >
+            {evalLoading ? (
+              <>
+                <span className="btn-spinner" />
+                Evaluating…
+              </>
+            ) : (
+              'Evaluate on Test Set'
+            )}
+          </button>
+          {evalError && <p className="eval-btn-error">{evalError}</p>}
           </div>
         </aside>
 
@@ -753,6 +815,18 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {/* Evaluation modal */}
+      {showEvalModal && evalResult && (
+        <EvalModal
+          result={evalResult}
+          predKind={evalPredKind}
+          gtKind={evalGtKind}
+          onPredKind={setEvalPredKind}
+          onGtKind={setEvalGtKind}
+          onClose={() => setShowEvalModal(false)}
+        />
+      )}
     </div>
   )
 }
@@ -771,6 +845,192 @@ function StatCard({ label, value, accent }) {
     <div className="stat-card" style={{ borderTopColor: accent }}>
       <div className="stat-value">{value}</div>
       <div className="stat-label">{label}</div>
+    </div>
+  )
+}
+
+const EVAL_METRICS = [
+  { key: 'dice',      label: 'Dice' },
+  { key: 'iou',       label: 'IoU' },
+  { key: 'precision', label: 'Precision' },
+  { key: 'recall',    label: 'Recall' },
+]
+
+function metricColor(v) {
+  if (v == null) return 'var(--muted)'
+  if (v >= 0.8)  return 'var(--green)'
+  if (v >= 0.5)  return 'var(--gold)'
+  return 'var(--red)'
+}
+
+function EvalModal({ result, predKind, gtKind, onPredKind, onGtKind, onClose }) {
+  const aggKey = `${predKind}_vs_${gtKind}`
+  const agg    = result.aggregate[aggKey]
+
+  const [selectedRow,    setSelectedRow]    = useState(null)
+  const [compareData,    setCompareData]    = useState(null)
+  const [compareLoading, setCompareLoading] = useState(false)
+
+  const handleRowClick = async (filename) => {
+    if (selectedRow === filename) {
+      setSelectedRow(null)
+      setCompareData(null)
+      return
+    }
+    setSelectedRow(filename)
+    setCompareLoading(true)
+    setCompareData(null)
+    try {
+      const res = await fetch(`${API}/evaluate/compare/${encodeURIComponent(filename)}`)
+      if (res.ok) setCompareData(await res.json())
+    } catch {}
+    finally { setCompareLoading(false) }
+  }
+
+  const getRowMetrics = (row) => {
+    const gtData = row[gtKind]
+    return gtData ? gtData[predKind] : null
+  }
+
+  return (
+    <div className="eval-backdrop" onClick={onClose}>
+      <div className="eval-modal" onClick={(e) => e.stopPropagation()}>
+        {/* Header */}
+        <div className="eval-modal-header">
+          <div>
+            <h2 className="eval-modal-title">Test Set Evaluation</h2>
+            <span className="eval-modal-sub">
+              {result.n_evaluated} image{result.n_evaluated !== 1 ? 's' : ''} evaluated · crack class only
+            </span>
+          </div>
+          <button className="eval-modal-close" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+
+        {/* Toggle controls */}
+        <div className="eval-controls">
+          <div className="eval-control-group">
+            <span className="eval-control-label">Prediction</span>
+            <div className="eval-pill-group">
+              {[
+                { k: 'filtered_pred', label: 'Filtered (current settings)' },
+                { k: 'raw_pred',      label: 'Raw (no post-processing)' },
+              ].map(({ k, label }) => (
+                <button
+                  key={k}
+                  className={`eval-pill ${predKind === k ? 'eval-pill-active' : ''}`}
+                  onClick={() => onPredKind(k)}
+                >{label}</button>
+              ))}
+            </div>
+          </div>
+          <div className="eval-control-group">
+            <span className="eval-control-label">Ground Truth</span>
+            <div className="eval-pill-group">
+              {[
+                { k: 'filtered_gt', label: 'Filtered Labels' },
+                { k: 'raw_gt',      label: 'Original Labels' },
+              ].map(({ k, label }) => (
+                <button
+                  key={k}
+                  className={`eval-pill ${gtKind === k ? 'eval-pill-active' : ''}`}
+                  onClick={() => onGtKind(k)}
+                >{label}</button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Aggregate metric cards */}
+        {agg ? (
+          <div className="eval-agg-row">
+            {EVAL_METRICS.map(({ key, label }) => (
+              <div key={key} className="eval-agg-card">
+                <div className="eval-agg-value" style={{ color: metricColor(agg[key]) }}>
+                  {(agg[key] * 100).toFixed(1)}%
+                </div>
+                <div className="eval-agg-label">{label}</div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="eval-no-data">No data available for this combination.</div>
+        )}
+
+        {/* Comparison panel — shown when a row is selected */}
+        {(selectedRow) && (
+          <div className="eval-compare">
+            <div className="eval-compare-header">
+              <span className="eval-compare-name">{selectedRow}</span>
+              <button className="eval-compare-dismiss" onClick={() => { setSelectedRow(null); setCompareData(null) }}>✕</button>
+            </div>
+            {compareLoading ? (
+              <div className="eval-compare-loading"><span className="btn-spinner" /></div>
+            ) : compareData ? (
+              <>
+                <div className="eval-compare-single">
+                  {compareData[`${predKind}_vs_${gtKind}`] ? (
+                    <img
+                      src={`data:image/png;base64,${compareData[`${predKind}_vs_${gtKind}`]}`}
+                      alt="Comparison"
+                      className="eval-compare-img-full"
+                    />
+                  ) : (
+                    <div className="eval-compare-nogt">No data for this combination</div>
+                  )}
+                </div>
+                <div className="eval-compare-legend">
+                  <span className="eval-legend-item">
+                    <span className="eval-legend-dot" style={{ background: '#00ff00' }} />
+                    Correct (TP)
+                  </span>
+                  <span className="eval-legend-item">
+                    <span className="eval-legend-dot" style={{ background: '#ff3333' }} />
+                    False positive
+                  </span>
+                  <span className="eval-legend-item">
+                    <span className="eval-legend-dot" style={{ background: '#00ffff' }} />
+                    Missed (FN)
+                  </span>
+                </div>
+              </>
+            ) : null}
+          </div>
+        )}
+
+        {/* Per-image table */}
+        <div className="eval-table-wrap">
+          <table className="eval-table">
+            <thead>
+              <tr>
+                <th>Image</th>
+                {EVAL_METRICS.map(({ key, label }) => (
+                  <th key={key}>{label}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {result.results.map((row) => {
+                const m = getRowMetrics(row)
+                const isSelected = selectedRow === row.image
+                return (
+                  <tr
+                    key={row.image}
+                    className={`eval-table-row${isSelected ? ' eval-row-selected' : ''}`}
+                    onClick={() => handleRowClick(row.image)}
+                  >
+                    <td className="eval-table-filename">{row.image}</td>
+                    {EVAL_METRICS.map(({ key }) => (
+                      <td key={key} style={{ color: m ? metricColor(m[key]) : 'var(--muted)' }}>
+                        {m ? `${(m[key] * 100).toFixed(1)}%` : '—'}
+                      </td>
+                    ))}
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   )
 }

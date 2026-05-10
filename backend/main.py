@@ -947,6 +947,278 @@ def labeling_denoise(req: DenoiseRequest):
     return {"mask": base64.b64encode(buf.tobytes()).decode("utf-8")}
 
 
+# ---------------------------------------------------------------------------
+# Evaluation helpers + endpoint
+# ---------------------------------------------------------------------------
+
+# Per-image comparison thumbnails from the last /evaluate run
+_eval_image_cache: dict[str, dict] = {}
+
+
+def _create_comparison_overlay(
+    img_gray: np.ndarray,
+    pred_mask: np.ndarray,
+    gt_mask: Optional[np.ndarray],
+) -> np.ndarray:
+    """Composite overlay showing TP/FP/FN for cracks only (shapes ignored).
+
+    Colour coding:
+      Green  — True Positive  (both pred and GT say crack)
+      Red    — False Positive (pred says crack, GT says background)
+      Cyan   — False Negative (GT says crack, pred says background)
+
+    If gt_mask is None, only prediction cracks are shown in red.
+    """
+    img_bgr = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+    overlay = img_bgr.copy()
+    pred_crack = pred_mask == LINE_CLASS
+
+    if gt_mask is None:
+        overlay[pred_crack] = [0, 0, 255]          # red  — no GT available
+    else:
+        gt_crack = gt_mask == 255
+        overlay[pred_crack & gt_crack]   = [0, 255, 0]   # green  TP
+        overlay[pred_crack & ~gt_crack]  = [0, 0, 255]   # red    FP
+        overlay[~pred_crack & gt_crack]  = [255, 255, 0] # cyan   FN
+
+    return cv2.addWeighted(img_bgr, 0.5, overlay, 0.5, 0)
+
+
+def _thumb_b64(img_bgr: np.ndarray, max_dim: int = 900) -> str:
+    """Resize to max_dim and return base64-encoded PNG."""
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil = PILImage.fromarray(img_rgb)
+    w, h = pil.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        pil = pil.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _compute_crack_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
+    """Binary segmentation metrics for the crack class only.
+
+    pred_mask : model output where LINE_CLASS (255) = crack
+    gt_mask   : grayscale ground-truth where 255 = crack, 0 = background
+    """
+    if pred_mask.shape != gt_mask.shape:
+        pred_mask = cv2.resize(
+            pred_mask, (gt_mask.shape[1], gt_mask.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    pred_crack = pred_mask == LINE_CLASS
+    gt_crack   = gt_mask   == 255
+
+    tp = int(( pred_crack &  gt_crack).sum())
+    fp = int(( pred_crack & ~gt_crack).sum())
+    fn = int((~pred_crack &  gt_crack).sum())
+
+    # Perfect negative case: no cracks anywhere, none predicted
+    if tp == 0 and fp == 0 and fn == 0:
+        return {"dice": 1.0, "iou": 1.0, "precision": 1.0, "recall": 1.0}
+
+    dice      = round(2 * tp / (2 * tp + fp + fn), 4)
+    iou       = round(tp / (tp + fp + fn), 4)
+    precision = round(tp / (tp + fp), 4) if tp + fp > 0 else 0.0
+    recall    = round(tp / (tp + fn), 4) if tp + fn > 0 else 0.0
+    return {"dice": dice, "iou": iou, "precision": precision, "recall": recall}
+
+
+class EvaluateRequest(BaseModel):
+    model: str
+    resolution: int
+    split: bool = False
+    split_grid: int = 2
+    confidence_threshold: float = 0.5
+    close_gap_size: int = 0
+    min_crack_area: int = 0
+    max_circularity: float = 1.0
+    circle_mask: bool = False
+    circle_mask_margin: int = 0
+    circle_mask_offset_x: int = 0
+    circle_mask_offset_y: int = 0
+    intensity_min: int = 0
+    intensity_max: int = 255
+
+    @field_validator("resolution")
+    @classmethod
+    def validate_resolution(cls, v: int) -> int:
+        if v not in ALLOWED_RESOLUTIONS:
+            raise ValueError(f"Resolution must be one of {sorted(ALLOWED_RESOLUTIONS)}")
+        return v
+
+    @field_validator("split_grid")
+    @classmethod
+    def validate_grid(cls, v: int) -> int:
+        if v not in ALLOWED_GRIDS:
+            raise ValueError(f"split_grid must be one of {sorted(ALLOWED_GRIDS)}")
+        return v
+
+    @field_validator("confidence_threshold")
+    @classmethod
+    def validate_threshold(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("confidence_threshold must be between 0.0 and 1.0")
+        return v
+
+    @field_validator("close_gap_size")
+    @classmethod
+    def validate_close_gap_size(cls, v: int) -> int:
+        if not 0 <= v <= 15:
+            raise ValueError("close_gap_size must be 0–15")
+        return v
+
+    @field_validator("min_crack_area")
+    @classmethod
+    def validate_min_crack_area(cls, v: int) -> int:
+        if not 0 <= v <= 5000:
+            raise ValueError("min_crack_area must be 0–5000")
+        return v
+
+    @field_validator("max_circularity")
+    @classmethod
+    def validate_max_circularity(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("max_circularity must be 0.0–1.0")
+        return v
+
+
+@app.post("/evaluate")
+def evaluate_test_set(req: EvaluateRequest):
+    """Run inference on every labeled test image and return crack segmentation metrics.
+
+    For each image that has a ground-truth mask in Labeling/Masks, two predictions are computed:
+    - raw_pred    : model output before any post-processing
+    - filtered_pred: model output after applying the current post-processing settings
+
+    Each prediction is compared against both ground-truth variants:
+    - raw_gt      : Labeling/Masks/<stem>_mask.png
+    - filtered_gt : Labeling/Masks/<stem>_mask_filtered.png
+
+    Metrics returned (crack class only): Dice, IoU, Precision, Recall.
+    """
+    model_name = Path(req.model).name
+    model = _load_model(model_name)
+
+    per_image: list[dict] = []
+    _eval_image_cache.clear()
+
+    for img_path in sorted(LABEL_IMAGES_DIR.iterdir()):
+        if img_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+
+        stem = img_path.stem                               # e.g. "front_0200"
+        raw_gt_path      = LABEL_MASKS_DIR / f"{stem}_mask.png"
+        filtered_gt_path = LABEL_MASKS_DIR / f"{stem}_mask_filtered.png"
+
+        if not raw_gt_path.exists() and not filtered_gt_path.exists():
+            continue  # no ground-truth for this image → skip
+
+        img_gray = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        if img_gray is None:
+            continue
+
+        # ── Raw prediction (model output only, no post-processing) ──────────
+        if req.split:
+            raw_pred = _predict_split(
+                model, img_gray, req.resolution, req.split_grid, req.confidence_threshold
+            )
+        else:
+            raw_pred = _predict_whole(
+                model, img_gray, req.resolution, req.confidence_threshold
+            )
+
+        # ── Filtered prediction (apply current post-processing settings) ────
+        filt_pred = raw_pred.copy()
+        filt_pred = _apply_intensity_filter(filt_pred, img_gray, req.intensity_min, req.intensity_max)
+        circle = _detect_sample_circle(img_gray) if req.circle_mask else None
+        if req.circle_mask and circle is not None:
+            filt_pred = _apply_circle_mask(
+                filt_pred, circle,
+                req.circle_mask_margin, req.circle_mask_offset_x, req.circle_mask_offset_y,
+            )
+        filt_pred = _postprocess_crack_mask(
+            filt_pred, req.close_gap_size, req.min_crack_area, req.max_circularity
+        )
+
+        entry: dict = {"image": img_path.name}
+        gts: dict[str, np.ndarray] = {}  # gt_key → circle-masked GT array
+
+        for gt_key, gt_path in [("raw_gt", raw_gt_path), ("filtered_gt", filtered_gt_path)]:
+            if not gt_path.exists():
+                entry[gt_key] = None
+                continue
+            gt = cv2.imread(str(gt_path), cv2.IMREAD_GRAYSCALE)
+            if gt is None:
+                entry[gt_key] = None
+                continue
+            # Apply circle mask to GT as well so both sides are clipped identically
+            if req.circle_mask and circle is not None:
+                gt = _apply_circle_mask(
+                    gt, circle,
+                    req.circle_mask_margin, req.circle_mask_offset_x, req.circle_mask_offset_y,
+                )
+            gts[gt_key] = gt
+            entry[gt_key] = {
+                "raw_pred":      _compute_crack_metrics(raw_pred,  gt),
+                "filtered_pred": _compute_crack_metrics(filt_pred, gt),
+            }
+
+        per_image.append(entry)
+
+        # Cache combined comparison thumbnails — one per (pred_variant × gt_variant)
+        _eval_image_cache[img_path.name] = {
+            f"{pred_k}_vs_{gt_k}": _thumb_b64(
+                _create_comparison_overlay(img_gray, pm, gts.get(gt_k))
+            )
+            for pred_k, pm in [("raw_pred", raw_pred), ("filtered_pred", filt_pred)]
+            for gt_k in ("raw_gt", "filtered_gt")
+        }
+
+    # ── Aggregate (mean across images) for every pred × gt combination ──────
+    aggregate: dict = {}
+    for pred_k in ("raw_pred", "filtered_pred"):
+        for gt_k in ("raw_gt", "filtered_gt"):
+            vals = [
+                r[gt_k][pred_k]
+                for r in per_image
+                if r.get(gt_k) is not None
+            ]
+            if vals:
+                aggregate[f"{pred_k}_vs_{gt_k}"] = {
+                    m: round(sum(v[m] for v in vals) / len(vals), 4)
+                    for m in ("dice", "iou", "precision", "recall")
+                }
+
+    return {
+        "results":     per_image,
+        "aggregate":   aggregate,
+        "n_evaluated": len(per_image),
+    }
+
+
+@app.get("/evaluate/compare/{filename}")
+def evaluate_compare(filename: str):
+    """Return cached comparison thumbnails for a single image from the last /evaluate run.
+
+    Returns:
+        original      — grayscale original image
+        raw_pred      — red overlay: unfiltered model prediction
+        filtered_pred — red overlay: post-processed prediction
+        raw_gt        — cyan overlay: original ground-truth labels (or null)
+        filtered_gt   — cyan overlay: filtered ground-truth labels (or null)
+    """
+    safe = Path(filename).name
+    if safe not in _eval_image_cache:
+        raise HTTPException(
+            status_code=404,
+            detail="No comparison data cached. Run /evaluate first.",
+        )
+    return _eval_image_cache[safe]
+
+
 @app.get("/labeling/images")
 def labeling_list_images():
     """List images available for labeling in Labeling/Images."""
