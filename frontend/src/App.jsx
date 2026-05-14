@@ -55,6 +55,27 @@ export default function App() {
   const hasResultRef = useRef(false)  // guards filter effect from running before first predict
   const canvasRef = useRef(null)
 
+  // Detection mode
+  const [detectionMode, setDetectionMode] = useState('synthetic') // 'synthetic' | 'unsupervised'
+  const [unsupParams, setUnsupParams] = useState({
+    method: 'frangi_sato',
+    // Frangi / Sato
+    fs_filter: 'sato', fs_sigma_min: 1, fs_sigma_max: 4,
+    fs_threshold_method: 'percentile', fs_percentile: 93, fs_min_component_size: 100,
+    // Matched Filter
+    mf_n_orientations: 12, mf_sigma_x: 1.5, mf_sigma_y: 6.0, mf_kernel_size: 25,
+    mf_threshold_method: 'percentile', mf_percentile: 97, mf_min_component_size: 100,
+    // Top-Hat
+    th_line_length: 40, th_n_orientations: 20,
+    th_threshold_method: 'percentile', th_percentile: 97,
+    th_min_component_size: 100, th_min_aspect_ratio: 2.0,
+    // Attribute Filter
+    af_bg_disk_radius: 15, af_threshold_method: 'otsu', af_adaptive_block: 51,
+    af_min_area: 50, af_min_eccentricity: 0.90, af_min_axis_ratio: 3.0,
+    af_max_circularity: 0.40, af_min_skeleton_length: 15,
+  })
+  const setP = (key, val) => setUnsupParams(p => ({ ...p, [key]: val }))
+
   // Test-set evaluation
   const [evalResult, setEvalResult]     = useState(null)
   const [evalLoading, setEvalLoading]   = useState(false)
@@ -207,33 +228,74 @@ export default function App() {
   }, [result, activeTab, intensityMin, intensityMax, showClasses, circleMask, circleOverlayOpacity])
 
   const handlePredict = async () => {
-    if (!selectedModel || !selectedSample) return
+    if (!selectedSample) return
+    if (detectionMode === 'synthetic' && !selectedModel) return
     setLoading(true)
     setError(null)
     setResult(null)
 
+    const commonPostProc = {
+      close_gap_size: closeGapSize, min_crack_area: minCrackArea,
+      max_circularity: maxCircularity, circle_mask: circleMask,
+      circle_mask_margin: circleMaskMargin, circle_mask_offset_x: circleMaskOffsetX,
+      circle_mask_offset_y: circleMaskOffsetY,
+      intensity_min: intensityMin, intensity_max: intensityMax,
+    }
+
     try {
-      const res = await fetch(`${API}/predict`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: selectedModel,
-          sample: selectedSample,
-          resolution,
-          split,
-          split_grid: splitGrid,
+      let endpoint, body
+      if (detectionMode === 'synthetic') {
+        endpoint = `${API}/predict`
+        body = {
+          model: selectedModel, sample: selectedSample,
+          resolution, split, split_grid: splitGrid,
           confidence_threshold: confidenceThreshold,
           show_classes: ['crack', 'shape'],
-          close_gap_size: closeGapSize,
-          min_crack_area: minCrackArea,
-          max_circularity: maxCircularity,
-          circle_mask: circleMask,
-          circle_mask_margin: circleMaskMargin,
-          circle_mask_offset_x: circleMaskOffsetX,
-          circle_mask_offset_y: circleMaskOffsetY,
-          intensity_min: intensityMin,
-          intensity_max: intensityMax,
-        }),
+          ...commonPostProc,
+        }
+      } else {
+        endpoint = `${API}/predict/unsupervised`
+        body = {
+          sample: selectedSample,
+          method: unsupParams.method,
+          ...commonPostProc,
+          // Frangi / Sato
+          fs_filter: unsupParams.fs_filter,
+          fs_sigma_min: unsupParams.fs_sigma_min,
+          fs_sigma_max: unsupParams.fs_sigma_max,
+          fs_threshold_method: unsupParams.fs_threshold_method,
+          fs_percentile: unsupParams.fs_percentile,
+          fs_min_component_size: unsupParams.fs_min_component_size,
+          // Matched Filter
+          mf_n_orientations: unsupParams.mf_n_orientations,
+          mf_sigma_x: unsupParams.mf_sigma_x,
+          mf_sigma_y: unsupParams.mf_sigma_y,
+          mf_kernel_size: unsupParams.mf_kernel_size,
+          mf_threshold_method: unsupParams.mf_threshold_method,
+          mf_percentile: unsupParams.mf_percentile,
+          mf_min_component_size: unsupParams.mf_min_component_size,
+          // Top-Hat
+          th_line_length: unsupParams.th_line_length,
+          th_n_orientations: unsupParams.th_n_orientations,
+          th_threshold_method: unsupParams.th_threshold_method,
+          th_percentile: unsupParams.th_percentile,
+          th_min_component_size: unsupParams.th_min_component_size,
+          th_min_aspect_ratio: unsupParams.th_min_aspect_ratio,
+          // Attribute Filter
+          af_bg_disk_radius: unsupParams.af_bg_disk_radius,
+          af_threshold_method: unsupParams.af_threshold_method,
+          af_adaptive_block: unsupParams.af_adaptive_block,
+          af_min_area: unsupParams.af_min_area,
+          af_min_eccentricity: unsupParams.af_min_eccentricity,
+          af_min_axis_ratio: unsupParams.af_min_axis_ratio,
+          af_max_circularity: unsupParams.af_max_circularity,
+          af_min_skeleton_length: unsupParams.af_min_skeleton_length,
+        }
+      }
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
       })
 
       if (!res.ok) {
@@ -261,29 +323,50 @@ export default function App() {
   }
 
   const handleEvaluate = async () => {
-    if (!selectedModel) return
+    if (detectionMode === 'synthetic' && !selectedModel) return
     setEvalLoading(true)
     setEvalError(null)
     try {
-      const res = await fetch(`${API}/evaluate`, {
+      const commonPostProc = {
+        close_gap_size: closeGapSize, min_crack_area: minCrackArea,
+        max_circularity: maxCircularity, circle_mask: circleMask,
+        circle_mask_margin: circleMaskMargin, circle_mask_offset_x: circleMaskOffsetX,
+        circle_mask_offset_y: circleMaskOffsetY,
+        intensity_min: intensityMin, intensity_max: intensityMax,
+      }
+      let endpoint, body
+      if (detectionMode === 'synthetic') {
+        endpoint = `${API}/evaluate`
+        body = {
+          model: selectedModel, resolution, split, split_grid: splitGrid,
+          confidence_threshold: confidenceThreshold,
+          ...commonPostProc,
+        }
+      } else {
+        endpoint = `${API}/evaluate/unsupervised`
+        body = {
+          method: unsupParams.method,
+          ...commonPostProc,
+          fs_filter: unsupParams.fs_filter, fs_sigma_min: unsupParams.fs_sigma_min, fs_sigma_max: unsupParams.fs_sigma_max,
+          fs_threshold_method: unsupParams.fs_threshold_method, fs_percentile: unsupParams.fs_percentile,
+          fs_min_component_size: unsupParams.fs_min_component_size,
+          mf_n_orientations: unsupParams.mf_n_orientations, mf_sigma_x: unsupParams.mf_sigma_x,
+          mf_sigma_y: unsupParams.mf_sigma_y, mf_kernel_size: unsupParams.mf_kernel_size,
+          mf_threshold_method: unsupParams.mf_threshold_method, mf_percentile: unsupParams.mf_percentile,
+          mf_min_component_size: unsupParams.mf_min_component_size,
+          th_line_length: unsupParams.th_line_length, th_n_orientations: unsupParams.th_n_orientations,
+          th_threshold_method: unsupParams.th_threshold_method, th_percentile: unsupParams.th_percentile,
+          th_min_component_size: unsupParams.th_min_component_size, th_min_aspect_ratio: unsupParams.th_min_aspect_ratio,
+          af_bg_disk_radius: unsupParams.af_bg_disk_radius, af_threshold_method: unsupParams.af_threshold_method,
+          af_adaptive_block: unsupParams.af_adaptive_block, af_min_area: unsupParams.af_min_area,
+          af_min_eccentricity: unsupParams.af_min_eccentricity, af_min_axis_ratio: unsupParams.af_min_axis_ratio,
+          af_max_circularity: unsupParams.af_max_circularity, af_min_skeleton_length: unsupParams.af_min_skeleton_length,
+        }
+      }
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: selectedModel,
-          resolution,
-          split,
-          split_grid: splitGrid,
-          confidence_threshold: confidenceThreshold,
-          close_gap_size: closeGapSize,
-          min_crack_area: minCrackArea,
-          max_circularity: maxCircularity,
-          circle_mask: circleMask,
-          circle_mask_margin: circleMaskMargin,
-          circle_mask_offset_x: circleMaskOffsetX,
-          circle_mask_offset_y: circleMaskOffsetY,
-          intensity_min: intensityMin,
-          intensity_max: intensityMax,
-        }),
+        body: JSON.stringify(body),
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
@@ -318,18 +401,20 @@ export default function App() {
         {/* ── Sidebar ── */}
         <aside className="sidebar">
           <div className="sidebar-scroll">
-          <Section label="Model">
-            <select
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
-              disabled={loading}
-            >
-              {models.map((m) => (
-                <option key={m} value={m}>
-                  {m.replace('.pt', '')}
-                </option>
+          <Section label="Detection Mode">
+            <div className="chip-group">
+              {[
+                { k: 'synthetic',    l: 'Synthetic Model' },
+                { k: 'unsupervised', l: 'Unsupervised' },
+              ].map(({ k, l }) => (
+                <button
+                  key={k}
+                  className={`chip ${detectionMode === k ? 'chip-active' : ''}`}
+                  onClick={() => { setDetectionMode(k); setResult(null); hasResultRef.current = false }}
+                  disabled={loading}
+                >{l}</button>
               ))}
-            </select>
+            </div>
           </Section>
 
           <Section label="Sample">
@@ -346,99 +431,317 @@ export default function App() {
             </select>
           </Section>
 
-          <Section label="Inference Resolution">
-            <div className="chip-group">
-              {RESOLUTIONS.map((r) => (
-                <button
-                  key={r}
-                  className={`chip ${resolution === r ? 'chip-active' : ''}`}
-                  onClick={() => setResolution(r)}
-                  disabled={loading}
-                >
-                  {r}×{r}
-                </button>
-              ))}
-            </div>
-          </Section>
-
-          <Section label="Split & Predict">
-            <div className="toggle-row">
-              <span className="toggle-desc">Split image into tiles</span>
-              <button
-                className={`toggle ${split ? 'toggle-on' : ''}`}
-                onClick={() => setSplit((v) => !v)}
+          {detectionMode === 'synthetic' && (<>
+            <Section label="Model">
+              <select
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
                 disabled={loading}
-                aria-pressed={split}
               >
-                <span className="toggle-thumb" />
-              </button>
-            </div>
-            <p className="hint">
-              Divides the image into tiles, predicts each part at the chosen resolution, then
-              stitches results together — useful for very large images.
-            </p>
-          </Section>
+                {models.map((m) => (
+                  <option key={m} value={m}>
+                    {m.replace('.pt', '')}
+                  </option>
+                ))}
+              </select>
+            </Section>
 
-          {split && (
-            <Section label="Grid Size">
+            <Section label="Inference Resolution">
               <div className="chip-group">
-                {GRIDS.map((g) => (
+                {RESOLUTIONS.map((r) => (
                   <button
-                    key={g}
-                    className={`chip ${splitGrid === g ? 'chip-active' : ''}`}
-                    onClick={() => setSplitGrid(g)}
+                    key={r}
+                    className={`chip ${resolution === r ? 'chip-active' : ''}`}
+                    onClick={() => setResolution(r)}
                     disabled={loading}
                   >
-                    {g}×{g}
+                    {r}×{r}
                   </button>
                 ))}
               </div>
             </Section>
-          )}
 
-          <Section label="Show Classes">
-            <div className="class-toggles">
-              <button
-                className={`class-btn class-btn-crack ${showClasses.crack ? 'class-btn-active' : ''}`}
-                onClick={() => setShowClasses((s) => ({ ...s, crack: !s.crack }))}
-                disabled={loading}
-              >
-                <span className="class-dot" style={{ background: 'var(--red)' }} />
-                Crack
-              </button>
-              <button
-                className={`class-btn class-btn-shape ${showClasses.shape ? 'class-btn-active-shape' : ''}`}
-                onClick={() => setShowClasses((s) => ({ ...s, shape: !s.shape }))}
-                disabled={loading}
-              >
-                <span className="class-dot" style={{ background: 'var(--gold)' }} />
-                Shape
-              </button>
-            </div>
-            <p className="hint">Toggle which defect classes appear in the output mask and overlay.</p>
-          </Section>
+            <Section label="Split & Predict">
+              <div className="toggle-row">
+                <span className="toggle-desc">Split image into tiles</span>
+                <button
+                  className={`toggle ${split ? 'toggle-on' : ''}`}
+                  onClick={() => setSplit((v) => !v)}
+                  disabled={loading}
+                  aria-pressed={split}
+                >
+                  <span className="toggle-thumb" />
+                </button>
+              </div>
+              <p className="hint">
+                Divides the image into tiles, predicts each part at the chosen resolution, then
+                stitches results together — useful for very large images.
+              </p>
+            </Section>
 
-          <Section label={`Confidence Threshold — ${confidenceThreshold.toFixed(2)}`}>
-            <input
-              type="range"
-              min="0.1"
-              max="0.99"
-              step="0.01"
-              value={confidenceThreshold}
-              onChange={(e) => setConfidenceThreshold(parseFloat(e.target.value))}
-              disabled={loading}
-              className="threshold-slider"
-            />
-            <div className="threshold-labels">
-              <span>Low (0.10)</span>
-              <span>High (0.99)</span>
-            </div>
-            <p className="hint">
-              Only label a pixel as crack/shape when the model's softmax
-              confidence exceeds this value. Lower = more detections, higher =
-              only high-confidence predictions.
-            </p>
-          </Section>
+            {split && (
+              <Section label="Grid Size">
+                <div className="chip-group">
+                  {GRIDS.map((g) => (
+                    <button
+                      key={g}
+                      className={`chip ${splitGrid === g ? 'chip-active' : ''}`}
+                      onClick={() => setSplitGrid(g)}
+                      disabled={loading}
+                    >
+                      {g}×{g}
+                    </button>
+                  ))}
+                </div>
+              </Section>
+            )}
+
+            <Section label="Show Classes">
+              <div className="class-toggles">
+                <button
+                  className={`class-btn class-btn-crack ${showClasses.crack ? 'class-btn-active' : ''}`}
+                  onClick={() => setShowClasses((s) => ({ ...s, crack: !s.crack }))}
+                  disabled={loading}
+                >
+                  <span className="class-dot" style={{ background: 'var(--red)' }} />
+                  Crack
+                </button>
+                <button
+                  className={`class-btn class-btn-shape ${showClasses.shape ? 'class-btn-active-shape' : ''}`}
+                  onClick={() => setShowClasses((s) => ({ ...s, shape: !s.shape }))}
+                  disabled={loading}
+                >
+                  <span className="class-dot" style={{ background: 'var(--gold)' }} />
+                  Shape
+                </button>
+              </div>
+              <p className="hint">Toggle which defect classes appear in the output mask and overlay.</p>
+            </Section>
+
+            <Section label={`Confidence Threshold — ${confidenceThreshold.toFixed(2)}`}>
+              <input
+                type="range"
+                min="0.1"
+                max="0.99"
+                step="0.01"
+                value={confidenceThreshold}
+                onChange={(e) => setConfidenceThreshold(parseFloat(e.target.value))}
+                disabled={loading}
+                className="threshold-slider"
+              />
+              <div className="threshold-labels">
+                <span>Low (0.10)</span>
+                <span>High (0.99)</span>
+              </div>
+              <p className="hint">
+                Only label a pixel as crack/shape when the model's softmax
+                confidence exceeds this value. Lower = more detections, higher =
+                only high-confidence predictions.
+              </p>
+            </Section>
+          </>)}
+
+          {detectionMode === 'unsupervised' && (<>
+            <Section label="Method">
+              <div className="chip-group">
+                {[
+                  { k: 'frangi_sato',    l: 'Frangi / Sato' },
+                  { k: 'matched_filter', l: 'Matched Filter' },
+                  { k: 'tophat',         l: 'Top-Hat' },
+                  { k: 'attribute',      l: 'Attribute Filter' },
+                ].map(({ k, l }) => (
+                  <button
+                    key={k}
+                    className={`chip ${unsupParams.method === k ? 'chip-active' : ''}`}
+                    onClick={() => setP('method', k)}
+                    disabled={loading}
+                  >{l}</button>
+                ))}
+              </div>
+              <p className="hint" style={{ marginTop: 4 }}>
+                {unsupParams.method === 'frangi_sato'    && 'Hessian-based multiscale ridge filter — enhances thin curvilinear structures.'}
+                {unsupParams.method === 'matched_filter' && 'Oriented Gaussian kernels — high response where the image matches a line-shaped template.'}
+                {unsupParams.method === 'tophat'         && 'Morphological white top-hat with line structuring elements at multiple orientations.'}
+                {unsupParams.method === 'attribute'      && 'Threshold + keep only components with crack-like shape attributes (elongated, low circularity).'}
+              </p>
+            </Section>
+
+            {/* ── Frangi / Sato ── */}
+            {unsupParams.method === 'frangi_sato' && (<>
+              <Section label="Filter Type">
+                <div className="chip-group">
+                  {[{k:'sato',l:'Sato'},{k:'frangi',l:'Frangi'}].map(({k,l}) => (
+                    <button key={k} className={`chip ${unsupParams.fs_filter===k?'chip-active':''}`} onClick={()=>setP('fs_filter',k)} disabled={loading}>{l}</button>
+                  ))}
+                </div>
+                <p className="hint">Sato is more robust to noise; Frangi emphasises vessel-like ridges.</p>
+              </Section>
+              <Section label={`Scale Range — σ ${unsupParams.fs_sigma_min}–${unsupParams.fs_sigma_max}`}>
+                <div className="filter-row">
+                  <div className="filter-row-header"><span className="filter-label">Min σ</span><span className="filter-value">{unsupParams.fs_sigma_min}</span></div>
+                  <input type="range" min="1" max="6" step="1" value={unsupParams.fs_sigma_min}
+                    onChange={(e)=>setP('fs_sigma_min', Math.min(+e.target.value, unsupParams.fs_sigma_max-1))}
+                    disabled={loading} className="threshold-slider" />
+                  <div className="filter-row-header" style={{marginTop:6}}><span className="filter-label">Max σ</span><span className="filter-value">{unsupParams.fs_sigma_max}</span></div>
+                  <input type="range" min="2" max="10" step="1" value={unsupParams.fs_sigma_max}
+                    onChange={(e)=>setP('fs_sigma_max', Math.max(+e.target.value, unsupParams.fs_sigma_min+1))}
+                    disabled={loading} className="threshold-slider" />
+                </div>
+                <p className="hint">Probes structures at these pixel radii. Increase max σ for wider cracks.</p>
+              </Section>
+              <Section label="Threshold Method">
+                <div className="chip-group">
+                  {[{k:'percentile',l:'Percentile'},{k:'otsu',l:'Otsu'},{k:'adaptive',l:'Adaptive'}].map(({k,l})=>(
+                    <button key={k} className={`chip ${unsupParams.fs_threshold_method===k?'chip-active':''}`} onClick={()=>setP('fs_threshold_method',k)} disabled={loading}>{l}</button>
+                  ))}
+                </div>
+              </Section>
+              {unsupParams.fs_threshold_method === 'percentile' && (
+                <Section label={`Percentile — ${unsupParams.fs_percentile}`}>
+                  <input type="range" min="70" max="99.5" step="0.5" value={unsupParams.fs_percentile}
+                    onChange={(e)=>setP('fs_percentile',+e.target.value)} disabled={loading} className="threshold-slider" />
+                  <div className="threshold-labels"><span>Sensitive (70)</span><span>Strict (99.5)</span></div>
+                  <p className="hint">Keep top {(100-unsupParams.fs_percentile).toFixed(1)}% of the filter response.</p>
+                </Section>
+              )}
+              <Section label={`Min Component Size — ${unsupParams.fs_min_component_size===0?'off':unsupParams.fs_min_component_size+' px'}`}>
+                <input type="range" min="0" max="500" step="10" value={unsupParams.fs_min_component_size}
+                  onChange={(e)=>setP('fs_min_component_size',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>Off</span><span>500 px</span></div>
+              </Section>
+            </>)}
+
+            {/* ── Matched Filter ── */}
+            {unsupParams.method === 'matched_filter' && (<>
+              <Section label={`Orientations — ${unsupParams.mf_n_orientations}`}>
+                <input type="range" min="4" max="24" step="2" value={unsupParams.mf_n_orientations}
+                  onChange={(e)=>setP('mf_n_orientations',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>4</span><span>24</span></div>
+                <p className="hint">More orientations = better coverage, slower inference.</p>
+              </Section>
+              <Section label={`σ_x (crack width) — ${unsupParams.mf_sigma_x}`}>
+                <input type="range" min="0.5" max="5" step="0.5" value={unsupParams.mf_sigma_x}
+                  onChange={(e)=>setP('mf_sigma_x',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>0.5</span><span>5</span></div>
+              </Section>
+              <Section label={`σ_y (crack length) — ${unsupParams.mf_sigma_y}`}>
+                <input type="range" min="2" max="20" step="1" value={unsupParams.mf_sigma_y}
+                  onChange={(e)=>setP('mf_sigma_y',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>2</span><span>20</span></div>
+              </Section>
+              <Section label={`Kernel Size — ${unsupParams.mf_kernel_size}`}>
+                <input type="range" min="11" max="51" step="2" value={unsupParams.mf_kernel_size}
+                  onChange={(e)=>setP('mf_kernel_size',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>11</span><span>51</span></div>
+              </Section>
+              <Section label="Threshold Method">
+                <div className="chip-group">
+                  {[{k:'percentile',l:'Percentile'},{k:'otsu',l:'Otsu'}].map(({k,l})=>(
+                    <button key={k} className={`chip ${unsupParams.mf_threshold_method===k?'chip-active':''}`} onClick={()=>setP('mf_threshold_method',k)} disabled={loading}>{l}</button>
+                  ))}
+                </div>
+              </Section>
+              {unsupParams.mf_threshold_method === 'percentile' && (
+                <Section label={`Percentile — ${unsupParams.mf_percentile}`}>
+                  <input type="range" min="80" max="99.5" step="0.5" value={unsupParams.mf_percentile}
+                    onChange={(e)=>setP('mf_percentile',+e.target.value)} disabled={loading} className="threshold-slider" />
+                  <div className="threshold-labels"><span>Sensitive (80)</span><span>Strict (99.5)</span></div>
+                  <p className="hint">Keep top {(100-unsupParams.mf_percentile).toFixed(1)}% of the filter response.</p>
+                </Section>
+              )}
+              <Section label={`Min Component Size — ${unsupParams.mf_min_component_size===0?'off':unsupParams.mf_min_component_size+' px'}`}>
+                <input type="range" min="0" max="500" step="10" value={unsupParams.mf_min_component_size}
+                  onChange={(e)=>setP('mf_min_component_size',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>Off</span><span>500 px</span></div>
+              </Section>
+            </>)}
+
+            {/* ── Top-Hat ── */}
+            {unsupParams.method === 'tophat' && (<>
+              <Section label={`Line Length — ${unsupParams.th_line_length} px`}>
+                <input type="range" min="10" max="80" step="5" value={unsupParams.th_line_length}
+                  onChange={(e)=>setP('th_line_length',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>10</span><span>80</span></div>
+                <p className="hint">Length of the line structuring element. Increase for longer cracks.</p>
+              </Section>
+              <Section label={`Orientations — ${unsupParams.th_n_orientations}`}>
+                <input type="range" min="4" max="36" step="2" value={unsupParams.th_n_orientations}
+                  onChange={(e)=>setP('th_n_orientations',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>4</span><span>36</span></div>
+              </Section>
+              <Section label="Threshold Method">
+                <div className="chip-group">
+                  {[{k:'percentile',l:'Percentile'},{k:'otsu',l:'Otsu'}].map(({k,l})=>(
+                    <button key={k} className={`chip ${unsupParams.th_threshold_method===k?'chip-active':''}`} onClick={()=>setP('th_threshold_method',k)} disabled={loading}>{l}</button>
+                  ))}
+                </div>
+              </Section>
+              {unsupParams.th_threshold_method === 'percentile' && (
+                <Section label={`Percentile — ${unsupParams.th_percentile}`}>
+                  <input type="range" min="80" max="99.5" step="0.5" value={unsupParams.th_percentile}
+                    onChange={(e)=>setP('th_percentile',+e.target.value)} disabled={loading} className="threshold-slider" />
+                  <div className="threshold-labels"><span>Sensitive (80)</span><span>Strict (99.5)</span></div>
+                  <p className="hint">Keep top {(100-unsupParams.th_percentile).toFixed(1)}% of the filter response.</p>
+                </Section>
+              )}
+              <Section label={`Min Component Size — ${unsupParams.th_min_component_size===0?'off':unsupParams.th_min_component_size+' px'}`}>
+                <input type="range" min="0" max="500" step="10" value={unsupParams.th_min_component_size}
+                  onChange={(e)=>setP('th_min_component_size',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>Off</span><span>500 px</span></div>
+              </Section>
+              <Section label={`Min Aspect Ratio — ${unsupParams.th_min_aspect_ratio}`}>
+                <input type="range" min="1" max="10" step="0.5" value={unsupParams.th_min_aspect_ratio}
+                  onChange={(e)=>setP('th_min_aspect_ratio',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>1 (any)</span><span>10 (elongated)</span></div>
+                <p className="hint">Keep components with major/minor axis ratio ≥ this. Removes round blobs.</p>
+              </Section>
+            </>)}
+
+            {/* ── Attribute Filter ── */}
+            {unsupParams.method === 'attribute' && (<>
+              <Section label={`BG Disk Radius — ${unsupParams.af_bg_disk_radius} px`}>
+                <input type="range" min="5" max="50" step="5" value={unsupParams.af_bg_disk_radius}
+                  onChange={(e)=>setP('af_bg_disk_radius',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>5</span><span>50</span></div>
+                <p className="hint">Background subtraction disk radius — should be larger than crack width.</p>
+              </Section>
+              <Section label="Threshold Method">
+                <div className="chip-group">
+                  {[{k:'otsu',l:'Otsu'},{k:'adaptive',l:'Adaptive'}].map(({k,l})=>(
+                    <button key={k} className={`chip ${unsupParams.af_threshold_method===k?'chip-active':''}`} onClick={()=>setP('af_threshold_method',k)} disabled={loading}>{l}</button>
+                  ))}
+                </div>
+              </Section>
+              <Section label={`Min Area — ${unsupParams.af_min_area} px`}>
+                <input type="range" min="10" max="500" step="10" value={unsupParams.af_min_area}
+                  onChange={(e)=>setP('af_min_area',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>10</span><span>500</span></div>
+              </Section>
+              <Section label={`Min Eccentricity — ${unsupParams.af_min_eccentricity.toFixed(2)}`}>
+                <input type="range" min="0.5" max="0.99" step="0.01" value={unsupParams.af_min_eccentricity}
+                  onChange={(e)=>setP('af_min_eccentricity',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>0.5</span><span>0.99</span></div>
+                <p className="hint">0 = circle, 1 = line. Cracks should have high eccentricity.</p>
+              </Section>
+              <Section label={`Min Axis Ratio — ${unsupParams.af_min_axis_ratio}`}>
+                <input type="range" min="1" max="10" step="0.5" value={unsupParams.af_min_axis_ratio}
+                  onChange={(e)=>setP('af_min_axis_ratio',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>1</span><span>10</span></div>
+              </Section>
+              <Section label={`Max Circularity — ${unsupParams.af_max_circularity.toFixed(2)}`}>
+                <input type="range" min="0.05" max="1" step="0.05" value={unsupParams.af_max_circularity}
+                  onChange={(e)=>setP('af_max_circularity',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>Strict (0.05)</span><span>Off (1.0)</span></div>
+                <p className="hint">4π·area/perimeter². Cracks score low; round blobs score near 1.</p>
+              </Section>
+              <Section label={`Min Skeleton Length — ${unsupParams.af_min_skeleton_length} px`}>
+                <input type="range" min="5" max="100" step="5" value={unsupParams.af_min_skeleton_length}
+                  onChange={(e)=>setP('af_min_skeleton_length',+e.target.value)} disabled={loading} className="threshold-slider" />
+                <div className="threshold-labels"><span>5</span><span>100</span></div>
+                <p className="hint">Minimum medial-axis length. Filters out short isolated blobs.</p>
+              </Section>
+            </>)}
+          </>)}
 
           <div className="filter-section-divider" />
 
@@ -673,7 +976,7 @@ export default function App() {
           <button
             className="eval-btn"
             onClick={handleEvaluate}
-            disabled={evalLoading || loading || !selectedModel}
+            disabled={evalLoading || loading || (detectionMode === 'synthetic' && !selectedModel)}
           >
             {evalLoading ? (
               <>

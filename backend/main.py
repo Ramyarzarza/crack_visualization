@@ -495,7 +495,229 @@ def _ndarray_to_base64(img: np.ndarray, is_bgr: bool = True) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Request/Response models
+# Unsupervised detection helpers
+# ---------------------------------------------------------------------------
+try:
+    from skimage.filters import (
+        frangi  as _sk_frangi,
+        sato    as _sk_sato,
+        threshold_otsu   as _sk_otsu,
+        threshold_local  as _sk_local,
+    )
+    from skimage.morphology import (
+        remove_small_objects as _sk_remove_small,
+        binary_closing       as _sk_bclosing,
+        disk                 as _sk_disk,
+        white_tophat         as _sk_white_tophat,
+        opening              as _sk_opening,
+        skeletonize          as _sk_skeletonize,
+    )
+    from skimage.measure import label as _sk_label, regionprops as _sk_regionprops
+    _SKIMAGE_AVAILABLE = True
+except ImportError:
+    _SKIMAGE_AVAILABLE = False
+    print("Warning: scikit-image not found — unsupervised methods unavailable. pip install scikit-image")
+
+
+def _check_skimage():
+    if not _SKIMAGE_AVAILABLE:
+        raise HTTPException(
+            status_code=500,
+            detail="scikit-image is not installed. Run: pip install scikit-image",
+        )
+
+
+def _unsup_threshold(response: np.ndarray, method: str, percentile: float) -> np.ndarray:
+    """Convert a float response map to a boolean binary mask."""
+    if method == "percentile":
+        pos = response[response > 0]
+        if pos.size == 0:
+            return np.zeros_like(response, dtype=bool)
+        return response > np.percentile(pos, percentile)
+    elif method == "otsu":
+        return response > _sk_otsu(response)
+    elif method == "adaptive":
+        return response > _sk_local(response, block_size=91, method="gaussian")
+    return np.zeros_like(response, dtype=bool)
+
+
+def _run_frangi_sato(
+    img_gray: np.ndarray,
+    filter_type: str = "sato",
+    sigma_min: int = 1,
+    sigma_max: int = 4,
+    threshold_method: str = "percentile",
+    percentile: float = 93.0,
+    min_component_size: int = 100,
+) -> np.ndarray:
+    """Frangi / Sato Hessian-based vesselness filter → LINE_CLASS mask."""
+    _check_skimage()
+    img_f   = img_gray.astype(np.float64) / 255.0
+    sigmas  = range(max(1, sigma_min), max(sigma_min + 1, sigma_max + 1))
+    response = _sk_frangi(img_f, sigmas=sigmas, black_ridges=False) if filter_type == "frangi" \
+               else _sk_sato(img_f, sigmas=sigmas, black_ridges=False)
+    binary = _unsup_threshold(response, threshold_method, percentile)
+    if min_component_size > 0:
+        binary = _sk_remove_small(binary, min_size=min_component_size)
+    binary = _sk_bclosing(binary, footprint=_sk_disk(1))
+    mask = np.zeros(img_gray.shape, dtype=np.uint8)
+    mask[binary] = LINE_CLASS
+    return mask
+
+
+def _build_matched_kernel(sigma_x: float, sigma_y: float, size: int) -> np.ndarray:
+    """Horizontal zero-mean Gaussian matched filter kernel."""
+    half = size // 2
+    xs   = np.linspace(-half, half, size)
+    ys   = np.linspace(-half, half, size)
+    X, Y = np.meshgrid(xs, ys)
+    k = np.exp(-(X**2 / (2 * sigma_x**2) + Y**2 / (2 * sigma_y**2)))
+    k -= k.mean()
+    return k.astype(np.float32)
+
+
+def _run_matched_filter(
+    img_gray: np.ndarray,
+    n_orientations: int = 12,
+    sigma_x: float = 1.5,
+    sigma_y: float = 6.0,
+    kernel_size: int = 25,
+    threshold_method: str = "percentile",
+    percentile: float = 97.0,
+    min_component_size: int = 100,
+) -> np.ndarray:
+    """Oriented Gaussian matched filter bank → LINE_CLASS mask."""
+    _check_skimage()
+    img_f = img_gray.astype(np.float32) / 255.0
+    ks    = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+    base  = _build_matched_kernel(sigma_x, sigma_y, ks)
+    cx, cy = ks / 2, ks / 2
+
+    response = np.full(img_f.shape, -np.inf, dtype=np.float32)
+    for angle in np.linspace(0, 180, n_orientations, endpoint=False):
+        M       = cv2.getRotationMatrix2D((cx, cy), -float(angle), 1.0)
+        rotated = cv2.warpAffine(base, M, (ks, ks), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_REFLECT)
+        resp    = cv2.filter2D(img_f, -1, rotated)
+        response = np.maximum(response, resp)
+
+    binary = _unsup_threshold(response.astype(np.float64), threshold_method, percentile)
+    if min_component_size > 0:
+        binary = _sk_remove_small(binary, min_size=min_component_size)
+    binary = _sk_bclosing(binary, footprint=_sk_disk(1))
+    mask = np.zeros(img_gray.shape, dtype=np.uint8)
+    mask[binary] = LINE_CLASS
+    return mask
+
+
+def _make_line_se(length: int, angle_deg: float) -> np.ndarray:
+    """Boolean line structuring element of given pixel length at angle_deg."""
+    size = length if length % 2 == 1 else length + 1
+    mid  = size // 2
+    se   = np.zeros((size, size), dtype=bool)
+    angle_rad = np.deg2rad(angle_deg)
+    half = length // 2
+    for t in range(-half, half + 1):
+        r = int(round(mid + t * np.sin(angle_rad)))
+        c = int(round(mid + t * np.cos(angle_rad)))
+        if 0 <= r < size and 0 <= c < size:
+            se[r, c] = True
+    return se
+
+
+def _run_tophat(
+    img_gray: np.ndarray,
+    line_length: int = 40,
+    n_orientations: int = 20,
+    threshold_method: str = "percentile",
+    percentile: float = 97.0,
+    min_component_size: int = 100,
+    min_aspect_ratio: float = 2.0,
+) -> np.ndarray:
+    """Morphological white top-hat with line SEs at multiple orientations → LINE_CLASS mask."""
+    _check_skimage()
+    img_f = img_gray.astype(np.float32) / 255.0
+
+    responses = []
+    for angle in np.linspace(0, 180, n_orientations, endpoint=False):
+        se = _make_line_se(line_length, angle)
+        responses.append(_sk_white_tophat(img_f, footprint=se))
+    response = np.max(responses, axis=0)
+
+    binary = _unsup_threshold(response.astype(np.float64), threshold_method, percentile)
+
+    # Remove small / overly round components
+    labeled = _sk_label(binary)
+    keep    = np.zeros_like(binary, dtype=bool)
+    for prop in _sk_regionprops(labeled):
+        if prop.area < max(1, min_component_size):
+            continue
+        if prop.minor_axis_length == 0:
+            continue
+        if prop.major_axis_length / prop.minor_axis_length < min_aspect_ratio:
+            continue
+        keep[labeled == prop.label] = True
+
+    mask = np.zeros(img_gray.shape, dtype=np.uint8)
+    mask[keep] = LINE_CLASS
+    return mask
+
+
+def _run_attribute_filter(
+    img_gray: np.ndarray,
+    bg_disk_radius: int = 15,
+    threshold_method: str = "otsu",
+    adaptive_block: int = 51,
+    min_area: int = 50,
+    min_eccentricity: float = 0.90,
+    min_axis_ratio: float = 3.0,
+    max_circularity: float = 0.4,
+    min_skeleton_length: int = 15,
+) -> np.ndarray:
+    """Threshold + shape-attribute component filtering → LINE_CLASS mask."""
+    _check_skimage()
+    img_f = img_gray.astype(np.float64) / 255.0
+
+    # Background subtraction (white top-hat with large disk)
+    bg       = _sk_opening(img_f, footprint=_sk_disk(bg_disk_radius))
+    residual = np.clip(img_f - bg, 0, 1)
+
+    # Threshold
+    if threshold_method == "otsu":
+        binary = residual > _sk_otsu(residual)
+    else:
+        block  = adaptive_block if adaptive_block % 2 == 1 else adaptive_block + 1
+        binary = residual > _sk_local(residual, block_size=block, method="gaussian")
+
+    # Shape-attribute filter
+    labeled = _sk_label(binary)
+    keep    = np.zeros_like(binary, dtype=bool)
+    for prop in _sk_regionprops(labeled):
+        if prop.area < min_area:
+            continue
+        if prop.eccentricity < min_eccentricity:
+            continue
+        if prop.minor_axis_length == 0:
+            continue
+        if prop.major_axis_length / prop.minor_axis_length < min_axis_ratio:
+            continue
+        if prop.perimeter > 0:
+            circ = (4 * np.pi * prop.area) / (prop.perimeter ** 2)
+            if circ > max_circularity:
+                continue
+        if min_skeleton_length > 0:
+            skel = _sk_skeletonize(labeled == prop.label)
+            if int(skel.sum()) < min_skeleton_length:
+                continue
+        keep[labeled == prop.label] = True
+
+    mask = np.zeros(img_gray.shape, dtype=np.uint8)
+    mask[keep] = LINE_CLASS
+    return mask
+
+
+# ---------------------------------------------------------------------------
+# Request/Response models (original section continues below)
 # ---------------------------------------------------------------------------
 class PredictRequest(BaseModel):
     model: str
@@ -732,6 +954,135 @@ def apply_filter(req: FilterRequest):
             "defect_percentage": round(line_pct + shape_pct, 3),
             "has_crack":  line_pct  > 0.1,
             "has_shape":  shape_pct > 0.1,
+            "image_size": {
+                "width":  int(img_gray.shape[1]),
+                "height": int(img_gray.shape[0]),
+            },
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Unsupervised predict endpoint
+# ---------------------------------------------------------------------------
+class UnsupervisedRequest(BaseModel):
+    sample:  str
+    method:  str   # "frangi_sato" | "matched_filter" | "tophat" | "attribute"
+    # Standard post-processing (same as /predict)
+    close_gap_size:      int   = 0
+    min_crack_area:      int   = 0
+    max_circularity:     float = 1.0
+    circle_mask:         bool  = False
+    circle_mask_margin:  int   = 0
+    circle_mask_offset_x: int  = 0
+    circle_mask_offset_y: int  = 0
+    intensity_min: int = 0
+    intensity_max: int = 255
+    # Frangi / Sato
+    fs_filter:             str   = "sato"
+    fs_sigma_min:          int   = 1
+    fs_sigma_max:          int   = 4
+    fs_threshold_method:   str   = "percentile"
+    fs_percentile:         float = 93.0
+    fs_min_component_size: int   = 100
+    # Matched Filter
+    mf_n_orientations:     int   = 12
+    mf_sigma_x:            float = 1.5
+    mf_sigma_y:            float = 6.0
+    mf_kernel_size:        int   = 25
+    mf_threshold_method:   str   = "percentile"
+    mf_percentile:         float = 97.0
+    mf_min_component_size: int   = 100
+    # Top-Hat
+    th_line_length:        int   = 40
+    th_n_orientations:     int   = 20
+    th_threshold_method:   str   = "percentile"
+    th_percentile:         float = 97.0
+    th_min_component_size: int   = 100
+    th_min_aspect_ratio:   float = 2.0
+    # Attribute Filter
+    af_bg_disk_radius:     int   = 15
+    af_threshold_method:   str   = "otsu"
+    af_adaptive_block:     int   = 51
+    af_min_area:           int   = 50
+    af_min_eccentricity:   float = 0.90
+    af_min_axis_ratio:     float = 3.0
+    af_max_circularity:    float = 0.4
+    af_min_skeleton_length: int  = 15
+
+    @field_validator("method")
+    @classmethod
+    def validate_method(cls, v: str) -> str:
+        valid = {"frangi_sato", "matched_filter", "tophat", "attribute"}
+        if v not in valid:
+            raise ValueError(f"method must be one of {valid}")
+        return v
+
+
+@app.post("/predict/unsupervised")
+def predict_unsupervised(req: UnsupervisedRequest):
+    """Run one of the four unsupervised crack detection methods on a single sample.
+
+    Produces the same response shape as /predict so the frontend can handle
+    both endpoints identically.  The raw method output is stored in
+    _filter_cache so the live /filter endpoint continues to work.
+    """
+    sample_name = Path(req.sample).name
+    sample_path = SAMPLES_DIR / sample_name
+    if not sample_path.exists():
+        raise HTTPException(status_code=404, detail=f"Sample not found: {sample_name}")
+
+    img_gray = cv2.imread(str(sample_path), cv2.IMREAD_GRAYSCALE)
+    if img_gray is None:
+        raise HTTPException(status_code=500, detail="Could not read image file")
+
+    # ── Run selected unsupervised method ──────────────────────────────────
+    raw_mask = _run_unsup_method(req, img_gray)
+
+    # ── Populate filter cache (enables live /filter updates) ──────────────
+    _filter_cache["img_gray"] = img_gray
+    _filter_cache["raw_mask"] = raw_mask.copy()
+    _filter_cache["circle"]   = _detect_sample_circle(img_gray)
+
+    # ── Apply standard post-processing ────────────────────────────────────
+    mask = raw_mask.copy()
+    mask = _apply_intensity_filter(mask, img_gray, req.intensity_min, req.intensity_max)
+    if req.circle_mask:
+        circle = _filter_cache.get("circle")
+        if circle is not None:
+            mask = _apply_circle_mask(
+                mask, circle,
+                req.circle_mask_margin, req.circle_mask_offset_x, req.circle_mask_offset_y,
+            )
+    mask = _postprocess_crack_mask(mask, req.close_gap_size, req.min_crack_area, req.max_circularity)
+
+    overlay_bgr = _create_overlay(img_gray, mask, alpha=0.4)
+    mask_rgb    = _mask_to_color_rgb(mask)
+
+    total    = mask.size
+    line_pct = float((mask == LINE_CLASS).sum() / total * 100)
+
+    raw_circle = _filter_cache.get("circle")
+    circle_out = (
+        {
+            "cx":     int(raw_circle[0] + req.circle_mask_offset_x),
+            "cy":     int(raw_circle[1] + req.circle_mask_offset_y),
+            "radius": int(raw_circle[2] + req.circle_mask_margin),
+        }
+        if raw_circle is not None else None
+    )
+
+    return {
+        "original": _ndarray_to_base64(cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR), is_bgr=True),
+        "mask":     _ndarray_to_base64(mask_rgb, is_bgr=False),
+        "overlay":  _ndarray_to_base64(overlay_bgr, is_bgr=True),
+        "circle":   circle_out,
+        "stats": {
+            "line_percentage":   round(line_pct, 3),
+            "shape_percentage":  0.0,
+            "defect_percentage": round(line_pct, 3),
+            "has_crack":  line_pct > 0.1,
+            "has_shape":  False,
             "image_size": {
                 "width":  int(img_gray.shape[1]),
                 "height": int(img_gray.shape[0]),
@@ -1178,6 +1529,205 @@ def evaluate_test_set(req: EvaluateRequest):
         }
 
     # ── Aggregate (mean across images) for every pred × gt combination ──────
+    aggregate: dict = {}
+    for pred_k in ("raw_pred", "filtered_pred"):
+        for gt_k in ("raw_gt", "filtered_gt"):
+            vals = [
+                r[gt_k][pred_k]
+                for r in per_image
+                if r.get(gt_k) is not None
+            ]
+            if vals:
+                aggregate[f"{pred_k}_vs_{gt_k}"] = {
+                    m: round(sum(v[m] for v in vals) / len(vals), 4)
+                    for m in ("dice", "iou", "precision", "recall")
+                }
+
+    return {
+        "results":     per_image,
+        "aggregate":   aggregate,
+        "n_evaluated": len(per_image),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Unsupervised evaluate endpoint
+# ---------------------------------------------------------------------------
+class UnsupervisedEvaluateRequest(BaseModel):
+    method:  str   # "frangi_sato" | "matched_filter" | "tophat" | "attribute"
+    # Standard post-processing
+    close_gap_size:       int   = 0
+    min_crack_area:       int   = 0
+    max_circularity:      float = 1.0
+    circle_mask:          bool  = False
+    circle_mask_margin:   int   = 0
+    circle_mask_offset_x: int   = 0
+    circle_mask_offset_y: int   = 0
+    intensity_min: int = 0
+    intensity_max: int = 255
+    # Frangi / Sato
+    fs_filter:             str   = "sato"
+    fs_sigma_min:          int   = 1
+    fs_sigma_max:          int   = 4
+    fs_threshold_method:   str   = "percentile"
+    fs_percentile:         float = 93.0
+    fs_min_component_size: int   = 100
+    # Matched Filter
+    mf_n_orientations:     int   = 12
+    mf_sigma_x:            float = 1.5
+    mf_sigma_y:            float = 6.0
+    mf_kernel_size:        int   = 25
+    mf_threshold_method:   str   = "percentile"
+    mf_percentile:         float = 97.0
+    mf_min_component_size: int   = 100
+    # Top-Hat
+    th_line_length:        int   = 40
+    th_n_orientations:     int   = 20
+    th_threshold_method:   str   = "percentile"
+    th_percentile:         float = 97.0
+    th_min_component_size: int   = 100
+    th_min_aspect_ratio:   float = 2.0
+    # Attribute Filter
+    af_bg_disk_radius:     int   = 15
+    af_threshold_method:   str   = "otsu"
+    af_adaptive_block:     int   = 51
+    af_min_area:           int   = 50
+    af_min_eccentricity:   float = 0.90
+    af_min_axis_ratio:     float = 3.0
+    af_max_circularity:    float = 0.4
+    af_min_skeleton_length: int  = 15
+
+    @field_validator("method")
+    @classmethod
+    def validate_method(cls, v: str) -> str:
+        valid = {"frangi_sato", "matched_filter", "tophat", "attribute"}
+        if v not in valid:
+            raise ValueError(f"method must be one of {valid}")
+        return v
+
+
+def _run_unsup_method(req: "UnsupervisedEvaluateRequest | UnsupervisedRequest", img_gray: np.ndarray) -> np.ndarray:
+    """Dispatch to the correct unsupervised function given a request object."""
+    if req.method == "frangi_sato":
+        return _run_frangi_sato(
+            img_gray,
+            filter_type=req.fs_filter,
+            sigma_min=req.fs_sigma_min,
+            sigma_max=req.fs_sigma_max,
+            threshold_method=req.fs_threshold_method,
+            percentile=req.fs_percentile,
+            min_component_size=req.fs_min_component_size,
+        )
+    elif req.method == "matched_filter":
+        return _run_matched_filter(
+            img_gray,
+            n_orientations=req.mf_n_orientations,
+            sigma_x=req.mf_sigma_x,
+            sigma_y=req.mf_sigma_y,
+            kernel_size=req.mf_kernel_size,
+            threshold_method=req.mf_threshold_method,
+            percentile=req.mf_percentile,
+            min_component_size=req.mf_min_component_size,
+        )
+    elif req.method == "tophat":
+        return _run_tophat(
+            img_gray,
+            line_length=req.th_line_length,
+            n_orientations=req.th_n_orientations,
+            threshold_method=req.th_threshold_method,
+            percentile=req.th_percentile,
+            min_component_size=req.th_min_component_size,
+            min_aspect_ratio=req.th_min_aspect_ratio,
+        )
+    else:  # "attribute"
+        return _run_attribute_filter(
+            img_gray,
+            bg_disk_radius=req.af_bg_disk_radius,
+            threshold_method=req.af_threshold_method,
+            adaptive_block=req.af_adaptive_block,
+            min_area=req.af_min_area,
+            min_eccentricity=req.af_min_eccentricity,
+            min_axis_ratio=req.af_min_axis_ratio,
+            max_circularity=req.af_max_circularity,
+            min_skeleton_length=req.af_min_skeleton_length,
+        )
+
+
+@app.post("/evaluate/unsupervised")
+def evaluate_unsupervised(req: UnsupervisedEvaluateRequest):
+    """Run an unsupervised crack detection method on every labeled test image.
+
+    Returns the same schema as /evaluate so the frontend EvalModal works unchanged.
+    - raw_pred    : method output (no post-processing)
+    - filtered_pred: method output + intensity filter + circle mask + postprocess
+    """
+    _check_skimage()
+    per_image: list[dict] = []
+    _eval_image_cache.clear()
+
+    for img_path in sorted(LABEL_IMAGES_DIR.iterdir()):
+        if img_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+
+        stem = img_path.stem
+        raw_gt_path      = LABEL_MASKS_DIR / f"{stem}_mask.png"
+        filtered_gt_path = LABEL_MASKS_DIR / f"{stem}_mask_filtered.png"
+
+        if not raw_gt_path.exists() and not filtered_gt_path.exists():
+            continue
+
+        img_gray = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        if img_gray is None:
+            continue
+
+        # ── Run the unsupervised method (raw output) ─────────────────────────
+        raw_pred = _run_unsup_method(req, img_gray)
+
+        # ── Filtered prediction: apply post-processing on top ────────────────
+        filt_pred = raw_pred.copy()
+        filt_pred = _apply_intensity_filter(filt_pred, img_gray, req.intensity_min, req.intensity_max)
+        circle = _detect_sample_circle(img_gray) if req.circle_mask else None
+        if req.circle_mask and circle is not None:
+            filt_pred = _apply_circle_mask(
+                filt_pred, circle,
+                req.circle_mask_margin, req.circle_mask_offset_x, req.circle_mask_offset_y,
+            )
+        filt_pred = _postprocess_crack_mask(
+            filt_pred, req.close_gap_size, req.min_crack_area, req.max_circularity
+        )
+
+        entry: dict = {"image": img_path.name}
+        gts: dict[str, np.ndarray] = {}
+
+        for gt_key, gt_path in [("raw_gt", raw_gt_path), ("filtered_gt", filtered_gt_path)]:
+            if not gt_path.exists():
+                entry[gt_key] = None
+                continue
+            gt = cv2.imread(str(gt_path), cv2.IMREAD_GRAYSCALE)
+            if gt is None:
+                entry[gt_key] = None
+                continue
+            if req.circle_mask and circle is not None:
+                gt = _apply_circle_mask(
+                    gt, circle,
+                    req.circle_mask_margin, req.circle_mask_offset_x, req.circle_mask_offset_y,
+                )
+            gts[gt_key] = gt
+            entry[gt_key] = {
+                "raw_pred":      _compute_crack_metrics(raw_pred,  gt),
+                "filtered_pred": _compute_crack_metrics(filt_pred, gt),
+            }
+
+        per_image.append(entry)
+
+        _eval_image_cache[img_path.name] = {
+            f"{pred_k}_vs_{gt_k}": _thumb_b64(
+                _create_comparison_overlay(img_gray, pm, gts.get(gt_k))
+            )
+            for pred_k, pm in [("raw_pred", raw_pred), ("filtered_pred", filt_pred)]
+            for gt_k in ("raw_gt", "filtered_gt")
+        }
+
     aggregate: dict = {}
     for pred_k in ("raw_pred", "filtered_pred"):
         for gt_k in ("raw_gt", "filtered_gt"):
