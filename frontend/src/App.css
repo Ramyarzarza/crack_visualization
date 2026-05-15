@@ -722,6 +722,27 @@ select:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 
 /* ── Evaluate button ── */
+.eval-btn-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.eval-dataset-select {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 0.8rem;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.eval-dataset-select:hover:not(:disabled),
+.eval-dataset-select:focus { border-color: var(--blue); }
+.eval-dataset-select:disabled { opacity: 0.4; cursor: not-allowed; }
 .eval-btn {
   width: 100%;
   padding: 9px;
@@ -733,7 +754,6 @@ select:disabled { opacity: 0.5; cursor: not-allowed; }
   font-weight: 500;
   cursor: pointer;
   transition: all 0.15s;
-  margin-top: 8px;
   display: flex;
   align-items: center;
   justify-content: center;

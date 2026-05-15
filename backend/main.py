@@ -94,6 +94,17 @@ LABEL_MASKS_DIR  = LABELING_DIR / "Masks"
 LABEL_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 LABEL_MASKS_DIR.mkdir(parents=True, exist_ok=True)
 
+DATA_DIR = BASE_DIR / "Data"
+
+# Known benchmark datasets: name → (img subdir, gt subdir)
+# GT files are matched by stem (filename without extension).
+BENCHMARK_DATASETS: dict[str, tuple[str, str]] = {
+    "XCAD":      ("test/img", "test/gt"),
+    "DRIVE":     ("test/img", "test/gt"),
+    "STARE":     ("test/img", "test/gt"),
+    "CrackTree": ("test/img", "test/gt"),
+}
+
 BACKGROUND_INDEX = 0
 LINE_INDEX = 1
 SHAPE_INDEX = 2
@@ -104,7 +115,7 @@ SHAPE_CLASS = 125
 
 ALLOWED_RESOLUTIONS = {256, 512, 800, 1600}
 ALLOWED_GRIDS = {2, 3, 4}
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".ppm"}
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -1365,16 +1376,22 @@ def _compute_crack_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
     tp = int(( pred_crack &  gt_crack).sum())
     fp = int(( pred_crack & ~gt_crack).sum())
     fn = int((~pred_crack &  gt_crack).sum())
+    tn = int((~pred_crack & ~gt_crack).sum())
 
     # Perfect negative case: no cracks anywhere, none predicted
     if tp == 0 and fp == 0 and fn == 0:
-        return {"dice": 1.0, "iou": 1.0, "precision": 1.0, "recall": 1.0}
+        return {"dice": 1.0, "iou": 1.0, "precision": 1.0, "recall": 1.0,
+                "accuracy": 1.0, "specificity": 1.0, "auc": 1.0}
 
-    dice      = round(2 * tp / (2 * tp + fp + fn), 4)
-    iou       = round(tp / (tp + fp + fn), 4)
-    precision = round(tp / (tp + fp), 4) if tp + fp > 0 else 0.0
-    recall    = round(tp / (tp + fn), 4) if tp + fn > 0 else 0.0
-    return {"dice": dice, "iou": iou, "precision": precision, "recall": recall}
+    dice        = round(2 * tp / (2 * tp + fp + fn), 4)
+    iou         = round(tp / (tp + fp + fn), 4)
+    precision   = round(tp / (tp + fp), 4) if tp + fp > 0 else 0.0
+    recall      = round(tp / (tp + fn), 4) if tp + fn > 0 else 0.0
+    specificity = round(tn / (tn + fp), 4) if tn + fp > 0 else 1.0
+    accuracy    = round((tp + tn) / (tp + tn + fp + fn), 4)
+    auc         = round(0.5 * (recall + specificity), 4)
+    return {"dice": dice, "iou": iou, "precision": precision, "recall": recall,
+            "accuracy": accuracy, "specificity": specificity, "auc": auc}
 
 
 class EvaluateRequest(BaseModel):
@@ -1540,13 +1557,190 @@ def evaluate_test_set(req: EvaluateRequest):
             if vals:
                 aggregate[f"{pred_k}_vs_{gt_k}"] = {
                     m: round(sum(v[m] for v in vals) / len(vals), 4)
-                    for m in ("dice", "iou", "precision", "recall")
+                    for m in ("dice", "iou", "precision", "recall", "accuracy", "specificity", "auc")
                 }
 
     return {
         "results":     per_image,
         "aggregate":   aggregate,
         "n_evaluated": len(per_image),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Benchmark evaluation endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/evaluate/benchmarks")
+def list_benchmarks():
+    """Return available benchmark dataset names."""
+    available = [
+        name for name in BENCHMARK_DATASETS
+        if (DATA_DIR / name).exists()
+    ]
+    return {"benchmarks": available}
+
+
+def _find_gt_for_image(gt_dir: Path, img_stem: str) -> Optional[Path]:
+    """Find a GT file in gt_dir whose stem matches img_stem.
+
+    Handles cases where the GT has a different extension or an extra suffix
+    (e.g. STARE: img stem 'im0001' → gt file 'im0001.ah.ppm').
+    """
+    for p in gt_dir.iterdir():
+        # Split on first dot to get the base stem (handles 'im0001.ah')
+        file_base = p.name.split(".")[0]
+        if file_base == img_stem:
+            return p
+    return None
+
+
+class BenchmarkEvaluateRequest(BaseModel):
+    dataset: str
+    model: str
+    resolution: int
+    split: bool = False
+    split_grid: int = 2
+    confidence_threshold: float = 0.5
+    close_gap_size: int = 0
+    min_crack_area: int = 0
+    max_circularity: float = 1.0
+    circle_mask: bool = False
+    circle_mask_margin: int = 0
+    circle_mask_offset_x: int = 0
+    circle_mask_offset_y: int = 0
+    intensity_min: int = 0
+    intensity_max: int = 255
+
+    @field_validator("dataset")
+    @classmethod
+    def validate_dataset(cls, v: str) -> str:
+        if v not in BENCHMARK_DATASETS:
+            raise ValueError(f"dataset must be one of {list(BENCHMARK_DATASETS)}")
+        return v
+
+    @field_validator("resolution")
+    @classmethod
+    def validate_resolution(cls, v: int) -> int:
+        if v not in ALLOWED_RESOLUTIONS:
+            raise ValueError(f"Resolution must be one of {sorted(ALLOWED_RESOLUTIONS)}")
+        return v
+
+    @field_validator("split_grid")
+    @classmethod
+    def validate_grid(cls, v: int) -> int:
+        if v not in ALLOWED_GRIDS:
+            raise ValueError(f"split_grid must be one of {sorted(ALLOWED_GRIDS)}")
+        return v
+
+    @field_validator("confidence_threshold")
+    @classmethod
+    def validate_threshold(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("confidence_threshold must be between 0.0 and 1.0")
+        return v
+
+
+@app.post("/evaluate/benchmark")
+def evaluate_benchmark(req: BenchmarkEvaluateRequest):
+    """Run inference on a benchmark dataset's test split and return crack metrics.
+
+    Images are read from Data/<dataset>/test/img/
+    GT masks are read from Data/<dataset>/test/gt/  (matched by stem)
+
+    GT masks are normalised to binary {0, 255} before metric computation.
+    Results follow the same schema as /evaluate (GT stored under 'raw_gt').
+    """
+    model_name = Path(req.model).name
+    model = _load_model(model_name)
+
+    img_subdir, gt_subdir = BENCHMARK_DATASETS[req.dataset]
+    img_dir = DATA_DIR / req.dataset / img_subdir
+    gt_dir  = DATA_DIR / req.dataset / gt_subdir
+
+    if not img_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Image directory not found: {img_dir}")
+    if not gt_dir.exists():
+        raise HTTPException(status_code=404, detail=f"GT directory not found: {gt_dir}")
+
+    per_image: list[dict] = []
+    _eval_image_cache.clear()
+
+    for img_path in sorted(img_dir.iterdir()):
+        if img_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        if img_path.name.startswith("."):
+            continue
+
+        gt_path = _find_gt_for_image(gt_dir, img_path.stem)
+        if gt_path is None:
+            continue  # no GT for this image
+
+        img_gray = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        if img_gray is None:
+            continue
+
+        gt_raw = cv2.imread(str(gt_path), cv2.IMREAD_GRAYSCALE)
+        if gt_raw is None:
+            continue
+        # Normalise to {0, 255} — handles both binary (0/1) and grayscale (0/255) GT masks
+        gt = (gt_raw > 0).astype(np.uint8) * 255
+
+        # ── Raw prediction ──────────────────────────────────────────────────
+        if req.split:
+            raw_pred = _predict_split(
+                model, img_gray, req.resolution, req.split_grid, req.confidence_threshold
+            )
+        else:
+            raw_pred = _predict_whole(
+                model, img_gray, req.resolution, req.confidence_threshold
+            )
+
+        # ── Filtered prediction ─────────────────────────────────────────────
+        filt_pred = raw_pred.copy()
+        filt_pred = _apply_intensity_filter(filt_pred, img_gray, req.intensity_min, req.intensity_max)
+        circle = _detect_sample_circle(img_gray) if req.circle_mask else None
+        if req.circle_mask and circle is not None:
+            filt_pred = _apply_circle_mask(
+                filt_pred, circle,
+                req.circle_mask_margin, req.circle_mask_offset_x, req.circle_mask_offset_y,
+            )
+        filt_pred = _postprocess_crack_mask(
+            filt_pred, req.close_gap_size, req.min_crack_area, req.max_circularity
+        )
+
+        entry: dict = {
+            "image":  img_path.name,
+            "raw_gt": {
+                "raw_pred":      _compute_crack_metrics(raw_pred,  gt),
+                "filtered_pred": _compute_crack_metrics(filt_pred, gt),
+            },
+            "filtered_gt": None,
+        }
+        per_image.append(entry)
+
+        _eval_image_cache[img_path.name] = {
+            f"{pred_k}_vs_raw_gt": _thumb_b64(
+                _create_comparison_overlay(img_gray, pm, gt)
+            )
+            for pred_k, pm in [("raw_pred", raw_pred), ("filtered_pred", filt_pred)]
+        }
+
+    # ── Aggregate (mean across images) ──────────────────────────────────────
+    aggregate: dict = {}
+    for pred_k in ("raw_pred", "filtered_pred"):
+        vals = [r["raw_gt"][pred_k] for r in per_image if r.get("raw_gt") is not None]
+        if vals:
+            aggregate[f"{pred_k}_vs_raw_gt"] = {
+                m: round(sum(v[m] for v in vals) / len(vals), 4)
+                for m in ("dice", "iou", "precision", "recall", "accuracy", "specificity", "auc")
+            }
+
+    return {
+        "results":     per_image,
+        "aggregate":   aggregate,
+        "n_evaluated": len(per_image),
+        "benchmark":   req.dataset,
     }
 
 
@@ -1739,7 +1933,7 @@ def evaluate_unsupervised(req: UnsupervisedEvaluateRequest):
             if vals:
                 aggregate[f"{pred_k}_vs_{gt_k}"] = {
                     m: round(sum(v[m] for v in vals) / len(vals), 4)
-                    for m in ("dice", "iou", "precision", "recall")
+                    for m in ("dice", "iou", "precision", "recall", "accuracy", "specificity", "auc")
                 }
 
     return {

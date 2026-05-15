@@ -5,3 +5,4 @@
 /sagemaker/model.tar.gz
 __pycache__/
 *.pyc
+Data

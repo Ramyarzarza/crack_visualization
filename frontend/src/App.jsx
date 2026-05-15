@@ -83,6 +83,8 @@ export default function App() {
   const [showEvalModal, setShowEvalModal] = useState(false)
   const [evalPredKind, setEvalPredKind] = useState('filtered_pred')
   const [evalGtKind,   setEvalGtKind]   = useState('filtered_gt')
+  const [evalDataset,  setEvalDataset]  = useState('labeling')
+  const [benchmarks,   setBenchmarks]   = useState([])
   const [viewerHeight, setViewerHeight] = useState(480)
   const dragState = useRef(null)
   const [stripHeight, setStripHeight] = useState(160)
@@ -102,6 +104,11 @@ export default function App() {
         setSamples(data.samples)
         if (data.samples.length > 0) setSelectedSample(data.samples[0])
       })
+      .catch(() => {})
+
+    fetch(`${API}/evaluate/benchmarks`)
+      .then((r) => r.json())
+      .then((data) => setBenchmarks(data.benchmarks ?? []))
       .catch(() => {})
   }, [])
 
@@ -335,7 +342,15 @@ export default function App() {
         intensity_min: intensityMin, intensity_max: intensityMax,
       }
       let endpoint, body
-      if (detectionMode === 'synthetic') {
+      if (detectionMode === 'synthetic' && evalDataset !== 'labeling') {
+        // Benchmark dataset evaluation
+        endpoint = `${API}/evaluate/benchmark`
+        body = {
+          dataset: evalDataset, model: selectedModel, resolution, split, split_grid: splitGrid,
+          confidence_threshold: confidenceThreshold,
+          ...commonPostProc,
+        }
+      } else if (detectionMode === 'synthetic') {
         endpoint = `${API}/evaluate`
         body = {
           model: selectedModel, resolution, split, split_grid: splitGrid,
@@ -373,6 +388,8 @@ export default function App() {
         throw new Error(err.detail || 'Evaluation failed')
       }
       const data = await res.json()
+      // For benchmark mode, fix gtKind so modal defaults to 'raw_gt'
+      if (evalDataset !== 'labeling') setEvalGtKind('raw_gt')
       setEvalResult(data)
       setShowEvalModal(true)
     } catch (err) {
@@ -973,20 +990,36 @@ export default function App() {
               'Predict'
             )}
           </button>
-          <button
-            className="eval-btn"
-            onClick={handleEvaluate}
-            disabled={evalLoading || loading || (detectionMode === 'synthetic' && !selectedModel)}
-          >
-            {evalLoading ? (
-              <>
-                <span className="btn-spinner" />
-                Evaluating…
-              </>
-            ) : (
-              'Evaluate on Test Set'
+          <div className="eval-btn-group">
+            {detectionMode === 'synthetic' && (
+              <select
+                className="eval-dataset-select"
+                value={evalDataset}
+                onChange={(e) => setEvalDataset(e.target.value)}
+                disabled={evalLoading}
+                title="Select evaluation dataset"
+              >
+                <option value="labeling">My Labeled Set</option>
+                {benchmarks.map((b) => (
+                  <option key={b} value={b}>{b}</option>
+                ))}
+              </select>
             )}
-          </button>
+            <button
+              className="eval-btn"
+              onClick={handleEvaluate}
+              disabled={evalLoading || loading || (detectionMode === 'synthetic' && !selectedModel)}
+            >
+              {evalLoading ? (
+                <>
+                  <span className="btn-spinner" />
+                  Evaluating…
+                </>
+              ) : (
+                'Evaluate on Test Set'
+              )}
+            </button>
+          </div>
           {evalError && <p className="eval-btn-error">{evalError}</p>}
           </div>
         </aside>
@@ -1127,6 +1160,7 @@ export default function App() {
           gtKind={evalGtKind}
           onPredKind={setEvalPredKind}
           onGtKind={setEvalGtKind}
+          isBenchmark={!!evalResult.benchmark}
           onClose={() => setShowEvalModal(false)}
         />
       )}
@@ -1153,10 +1187,12 @@ function StatCard({ label, value, accent }) {
 }
 
 const EVAL_METRICS = [
-  { key: 'dice',      label: 'Dice' },
-  { key: 'iou',       label: 'IoU' },
-  { key: 'precision', label: 'Precision' },
-  { key: 'recall',    label: 'Recall' },
+  { key: 'iou',         label: 'Jaccard' },
+  { key: 'dice',        label: 'Dice' },
+  { key: 'accuracy',    label: 'Acc.' },
+  { key: 'recall',      label: 'Sn.' },
+  { key: 'specificity', label: 'Sp.' },
+  { key: 'auc',         label: 'AUC' },
 ]
 
 function metricColor(v) {
@@ -1166,8 +1202,10 @@ function metricColor(v) {
   return 'var(--red)'
 }
 
-function EvalModal({ result, predKind, gtKind, onPredKind, onGtKind, onClose }) {
-  const aggKey = `${predKind}_vs_${gtKind}`
+function EvalModal({ result, predKind, gtKind, onPredKind, onGtKind, isBenchmark, onClose }) {
+  // For benchmark mode, GT is always 'raw_gt'
+  const effectiveGtKind = isBenchmark ? 'raw_gt' : gtKind
+  const aggKey = `${predKind}_vs_${effectiveGtKind}`
   const agg    = result.aggregate[aggKey]
 
   const [selectedRow,    setSelectedRow]    = useState(null)
@@ -1191,7 +1229,7 @@ function EvalModal({ result, predKind, gtKind, onPredKind, onGtKind, onClose }) 
   }
 
   const getRowMetrics = (row) => {
-    const gtData = row[gtKind]
+    const gtData = row[effectiveGtKind]
     return gtData ? gtData[predKind] : null
   }
 
@@ -1201,7 +1239,9 @@ function EvalModal({ result, predKind, gtKind, onPredKind, onGtKind, onClose }) 
         {/* Header */}
         <div className="eval-modal-header">
           <div>
-            <h2 className="eval-modal-title">Test Set Evaluation</h2>
+            <h2 className="eval-modal-title">
+              {isBenchmark ? `Benchmark: ${result.benchmark}` : 'Test Set Evaluation'}
+            </h2>
             <span className="eval-modal-sub">
               {result.n_evaluated} image{result.n_evaluated !== 1 ? 's' : ''} evaluated · crack class only
             </span>
@@ -1226,21 +1266,23 @@ function EvalModal({ result, predKind, gtKind, onPredKind, onGtKind, onClose }) 
               ))}
             </div>
           </div>
-          <div className="eval-control-group">
-            <span className="eval-control-label">Ground Truth</span>
-            <div className="eval-pill-group">
-              {[
-                { k: 'filtered_gt', label: 'Filtered Labels' },
-                { k: 'raw_gt',      label: 'Original Labels' },
-              ].map(({ k, label }) => (
-                <button
-                  key={k}
-                  className={`eval-pill ${gtKind === k ? 'eval-pill-active' : ''}`}
-                  onClick={() => onGtKind(k)}
-                >{label}</button>
-              ))}
+          {!isBenchmark && (
+            <div className="eval-control-group">
+              <span className="eval-control-label">Ground Truth</span>
+              <div className="eval-pill-group">
+                {[
+                  { k: 'filtered_gt', label: 'Filtered Labels' },
+                  { k: 'raw_gt',      label: 'Original Labels' },
+                ].map(({ k, label }) => (
+                  <button
+                    key={k}
+                    className={`eval-pill ${gtKind === k ? 'eval-pill-active' : ''}`}
+                    onClick={() => onGtKind(k)}
+                  >{label}</button>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
         </div>
 
         {/* Aggregate metric cards */}
@@ -1271,9 +1313,9 @@ function EvalModal({ result, predKind, gtKind, onPredKind, onGtKind, onClose }) 
             ) : compareData ? (
               <>
                 <div className="eval-compare-single">
-                  {compareData[`${predKind}_vs_${gtKind}`] ? (
+                  {compareData[`${predKind}_vs_${effectiveGtKind}`] ? (
                     <img
-                      src={`data:image/png;base64,${compareData[`${predKind}_vs_${gtKind}`]}`}
+                      src={`data:image/png;base64,${compareData[`${predKind}_vs_${effectiveGtKind}`]}`}
                       alt="Comparison"
                       className="eval-compare-img-full"
                     />
